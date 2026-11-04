@@ -25,7 +25,8 @@ platforms = ["linux", "macos", "windows"]
 
 [[build]]
 platforms = ["linux", "macos"]
-command = ["/bin/sh", "scripts/fetch-or-build.sh"]
+# Always build this fork; the upstream release does not include local changes.
+command = ["cargo", "build", "--release", "--locked"]
 
 [[build]]
 platforms = ["windows"]

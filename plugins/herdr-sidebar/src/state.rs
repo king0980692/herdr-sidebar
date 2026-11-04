@@ -462,17 +462,57 @@ fn legacy_state_path() -> Option<PathBuf> {
     Some(base?.join("herdr").join("aa-sidebar.json"))
 }
 
+/// User preferences are portable; view selection and prompt state stay local.
+fn settings_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("herdr-sidebar").join("settings.json"))
+}
+
+fn combine_state(local: &str, settings: Option<&str>) -> State {
+    let mut value = serde_json::from_str::<serde_json::Value>(local)
+        .ok()
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(settings) = settings
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| v.as_object().cloned())
+    {
+        let object = value.as_object_mut().expect("object");
+        for (key, value) in settings {
+            if !matches!(key.as_str(), "active" | "search_active" | "font_prompt") {
+                object.insert(key, value);
+            }
+        }
+    }
+    parse_state(&value.to_string())
+}
+
+#[cfg(test)]
+#[test]
+fn preferences_override_legacy_state_but_not_local_view() {
+    let state = combine_state(
+        r#"{"active":"source-control","sidebar_width":24,"auto_close":false}"#,
+        Some(r#"{"active":"explorer","sidebar_width":40,"auto_close":true}"#),
+    );
+    assert_eq!(state.active, View::SourceControl);
+    assert_eq!(state.sidebar_width, 40);
+    assert!(state.auto_close);
+    assert_eq!(
+        combine_state(r#"{"sidebar_width":44}"#, None).sidebar_width,
+        44
+    );
+}
+
 pub fn load_state() -> State {
-    if let Some(json) = state_path().and_then(|p| std::fs::read_to_string(p).ok()) {
-        return parse_state(&json);
-    }
-    // One-time migration from the legacy config-dir file.
-    if let Some(json) = legacy_state_path().and_then(|p| std::fs::read_to_string(p).ok()) {
-        let state = parse_state(&json);
-        save_state(state);
-        return state;
-    }
-    State::default()
+    let local = state_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .or_else(|| legacy_state_path().and_then(|p| std::fs::read_to_string(p).ok()))
+        .unwrap_or_default();
+    let settings = settings_path().and_then(|p| std::fs::read_to_string(p).ok());
+    combine_state(&local, settings.as_deref())
 }
 
 /// Best-effort persist; the sidebar still works for this session if it fails.
@@ -503,9 +543,9 @@ pub fn update_state(update: impl FnOnce(&mut State)) -> State {
         update(&mut state);
         return state;
     };
-    if let Ok(json) = std::fs::read_to_string(&path) {
-        state = parse_state(&json);
-    }
+    // Reload both files under the same local lock so concurrent panes do not
+    // overwrite each other's settings. Legacy state.json supplies defaults.
+    state = load_state();
     update(&mut state);
     write_state(&path, state);
     state
@@ -537,7 +577,47 @@ fn write_state(path: &Path, state: State) {
         state.custom_editor_on_click,
         state.scm_tree_view
     );
-    let _ = std::fs::write(path, json);
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&json) else {
+        return;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let mut local = serde_json::Map::new();
+    for key in ["active", "search_active", "font_prompt"] {
+        if let Some(value) = object.remove(key) {
+            local.insert(key.to_owned(), value);
+        }
+    }
+    let Some(settings_path) = settings_path() else {
+        return;
+    };
+    if let Some(dir) = settings_path.parent() {
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+    }
+    // Do not destroy a malformed settings file the user may need to recover.
+    if let Ok(existing) = std::fs::read_to_string(&settings_path) {
+        if serde_json::from_str::<serde_json::Value>(&existing)
+            .ok()
+            .and_then(|v| v.as_object().cloned())
+            .is_none()
+        {
+            return;
+        }
+    }
+    let Ok(settings) = serde_json::to_string_pretty(&value) else {
+        return;
+    };
+    if std::fs::read_to_string(&settings_path).ok().as_deref() != Some(settings.as_str())
+        && std::fs::write(&settings_path, settings).is_err()
+    {
+        return;
+    }
+    if let Ok(local) = serde_json::to_string(&local) {
+        let _ = std::fs::write(path, local);
+    }
 }
 
 struct StateWriteLock {

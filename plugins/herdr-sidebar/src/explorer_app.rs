@@ -5798,9 +5798,8 @@ fn usage_card(
         if several {
             // One section per account: its plan badge and who it is. The
             // first sits right under the header band; later ones get a
-            // light rule between them and the account above.
+            // light rule right below the account above, no blank line.
             if index > 0 {
-                lines.push(Line::raw(""));
                 lines.push(Line::styled(
                     format!(" {}", "─".repeat(width.saturating_sub(2))),
                     Style::default().fg(Color::DarkGray),

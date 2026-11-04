@@ -3705,9 +3705,13 @@ impl App {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
-                for provider in providers {
+                // Accounts of the same service (adjacent) share one card.
+                let mut rest = providers.as_slice();
+                while let Some(first) = rest.first() {
+                    let group: Vec<_> = rest.iter().take_while(|p| p.name == first.name).collect();
+                    rest = &rest[group.len()..];
                     lines.push(Line::raw(""));
-                    lines.extend(usage_card(provider, width, now));
+                    lines.extend(usage_card(&group, width, now));
                 }
             }
         }
@@ -5623,27 +5627,33 @@ fn usage_bar(used: f64, cells: usize, color: Color, pace: Option<f64>) -> Vec<Sp
         .collect()
 }
 
-/// One provider's card: a header band (name, plan badge, highest usage),
+/// One service's card — several accounts of it (e.g. Codex through the CLI
+/// and through pi) share one: a header band (name, plan badge when there is
+/// one account, highest usage of all), then per account its plan and email,
 /// then per window its label and percentage, a thin bar with the pace
 /// marker, and when it resets and how it compares with an even pace.
 fn usage_card(
-    provider: &herdr_sidebar::usage::Provider,
+    group: &[&herdr_sidebar::usage::Provider],
     width: usize,
     now: i64,
 ) -> Vec<Line<'static>> {
     let band = Style::default().bg(palette().selection_bg);
-    let worst = provider
-        .windows
+    let worst = group
         .iter()
+        .flat_map(|p| p.windows.iter())
         .max_by(|a, b| a.used.total_cmp(&b.used));
-    let mut head = vec![Span::styled(format!(" {} ", provider.name), band.bold())];
-    if let Some(plan) = &provider.plan {
-        head.push(Span::styled(
+    let several = group.len() > 1;
+    let plan_badge = |plan: &str| {
+        Span::styled(
             format!(" {plan} "),
             Style::default()
                 .bg(palette().muted_button_bg)
                 .fg(palette().muted_button_fg),
-        ));
+        )
+    };
+    let mut head = vec![Span::styled(format!(" {} ", group[0].name), band.bold())];
+    if let Some(plan) = group[0].plan.as_ref().filter(|_| !several) {
+        head.push(plan_badge(plan));
     }
     let worst_text = worst
         .map(|w| format!("{:.0}% ", w.used))
@@ -5661,85 +5671,106 @@ fn usage_card(
             .bold(),
     ));
     let mut lines = vec![Line::from(head)];
-    if let Some(account) = &provider.account {
-        lines.push(Line::styled(
-            format!(" {}", truncate_to(account.clone(), width.saturating_sub(2))),
-            Style::default().dim(),
-        ));
-    }
-    if let Some(err) = &provider.error {
-        lines.push(Line::styled(
-            format!("  ! {err}"),
-            Style::default().fg(palette().deleted),
-        ));
-    }
-    if let Some(note) = &provider.note {
-        lines.push(Line::styled(format!("  {note}"), Style::default().dim()));
-    }
-    let bar_cells = width.saturating_sub(4).max(4);
-    for w in &provider.windows {
-        lines.push(Line::raw(""));
-        let color = usage_color(w.used, w.limited);
-        let pct = format!("{:.0}%", w.used);
-        let badge = if w.limited { " LIMIT " } else { "" };
-        let label = truncate_to(
-            w.label.clone(),
-            width.saturating_sub(pct.len() + badge.len() + 5),
-        );
-        let pad = width
-            .saturating_sub(2 + Span::raw(label.as_str()).width() + badge.len() + pct.len() + 2);
-        let mut row = vec![
-            Span::raw("  "),
-            Span::styled(label, Style::default().bold()),
-            Span::raw(" ".repeat(pad)),
-        ];
-        if w.limited {
-            row.push(Span::styled(
-                badge,
-                Style::default()
-                    .bg(palette().deleted)
-                    .fg(Color::Black)
-                    .bold(),
-            ));
-            row.push(Span::raw(" "));
-        }
-        row.push(Span::styled(pct, Style::default().fg(color).bold()));
-        lines.push(Line::from(row));
-        // Where an even pace would be by now, when the window's length is known.
-        let pace = match (w.resets_at, w.length_secs) {
-            (Some(reset), Some(len)) if len > 0 => {
-                Some((1.0 - (reset - now) as f64 / len as f64).clamp(0.0, 1.0) * 100.0)
+    for provider in group {
+        if several {
+            // One section per account: its plan badge and who it is.
+            lines.push(Line::raw(""));
+            let mut sub = vec![Span::raw(" ")];
+            let mut used = 1;
+            if let Some(plan) = &provider.plan {
+                let badge = plan_badge(plan);
+                used += badge.width() + 1;
+                sub.push(badge);
+                sub.push(Span::raw(" "));
             }
-            _ => None,
-        };
-        let mut bar = vec![Span::raw("  ")];
-        bar.extend(usage_bar(w.used, bar_cells, color, pace));
-        lines.push(Line::from(bar));
-        let mut detail = vec![Span::raw("  ")];
-        if w.limited {
-            detail.push(Span::styled(
-                "limit reached · ",
-                Style::default().fg(palette().deleted).bold(),
-            ));
-        }
-        if let Some(reset) = w.resets_at {
-            detail.push(Span::styled(
-                format!("resets in {}", short_duration(reset - now)),
+            if let Some(account) = &provider.account {
+                sub.push(Span::styled(
+                    truncate_to(account.clone(), width.saturating_sub(used + 1)),
+                    Style::default().fg(palette().header_accent),
+                ));
+            }
+            lines.push(Line::from(sub));
+        } else if let Some(account) = &provider.account {
+            lines.push(Line::styled(
+                format!(" {}", truncate_to(account.clone(), width.saturating_sub(2))),
                 Style::default().dim(),
             ));
         }
-        // Against the pace marker, in words: only worth saying when ahead.
-        if let Some(p) = pace
-            && !w.limited
-            && w.used > p + 5.0
-        {
-            detail.push(Span::styled(
-                format!(" · {:.0}% ahead", w.used - p),
-                Style::default().fg(Color::Indexed(208)),
+        if let Some(err) = &provider.error {
+            lines.push(Line::styled(
+                format!("  ! {err}"),
+                Style::default().fg(palette().deleted),
             ));
         }
-        if detail.len() > 1 {
-            lines.push(Line::from(detail));
+        if let Some(note) = &provider.note {
+            lines.push(Line::styled(format!("  {note}"), Style::default().dim()));
+        }
+        let bar_cells = width.saturating_sub(4).max(4);
+        for w in &provider.windows {
+            lines.push(Line::raw(""));
+            let color = usage_color(w.used, w.limited);
+            let pct = format!("{:.0}%", w.used);
+            let badge = if w.limited { " LIMIT " } else { "" };
+            let label = truncate_to(
+                w.label.clone(),
+                width.saturating_sub(pct.len() + badge.len() + 5),
+            );
+            let pad = width.saturating_sub(
+                2 + Span::raw(label.as_str()).width() + badge.len() + pct.len() + 2,
+            );
+            let mut row = vec![
+                Span::raw("  "),
+                Span::styled(label, Style::default().bold()),
+                Span::raw(" ".repeat(pad)),
+            ];
+            if w.limited {
+                row.push(Span::styled(
+                    badge,
+                    Style::default()
+                        .bg(palette().deleted)
+                        .fg(Color::Black)
+                        .bold(),
+                ));
+                row.push(Span::raw(" "));
+            }
+            row.push(Span::styled(pct, Style::default().fg(color).bold()));
+            lines.push(Line::from(row));
+            // Where an even pace would be by now, when the window's length is known.
+            let pace = match (w.resets_at, w.length_secs) {
+                (Some(reset), Some(len)) if len > 0 => {
+                    Some((1.0 - (reset - now) as f64 / len as f64).clamp(0.0, 1.0) * 100.0)
+                }
+                _ => None,
+            };
+            let mut bar = vec![Span::raw("  ")];
+            bar.extend(usage_bar(w.used, bar_cells, color, pace));
+            lines.push(Line::from(bar));
+            let mut detail = vec![Span::raw("  ")];
+            if w.limited {
+                detail.push(Span::styled(
+                    "limit reached · ",
+                    Style::default().fg(palette().deleted).bold(),
+                ));
+            }
+            if let Some(reset) = w.resets_at {
+                detail.push(Span::styled(
+                    format!("resets in {}", short_duration(reset - now)),
+                    Style::default().dim(),
+                ));
+            }
+            // Against the pace marker, in words: only worth saying when ahead.
+            if let Some(p) = pace
+                && !w.limited
+                && w.used > p + 5.0
+            {
+                detail.push(Span::styled(
+                    format!(" · {:.0}% ahead", w.used - p),
+                    Style::default().fg(Color::Indexed(208)),
+                ));
+            }
+            if detail.len() > 1 {
+                lines.push(Line::from(detail));
+            }
         }
     }
     lines

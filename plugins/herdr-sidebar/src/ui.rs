@@ -454,6 +454,14 @@ pub fn activity_icons(theme: IconTheme) -> (&'static str, &'static str, &'static
     }
 }
 
+/// Theme-matched icon for the Usage view (subscription limits).
+pub fn usage_icon(theme: IconTheme) -> &'static str {
+    match theme {
+        IconTheme::Material => "\u{f080}",
+        IconTheme::Emoji => "📊",
+    }
+}
+
 /// Theme-matched ⚙ settings glyph.
 pub fn gear_icon(theme: IconTheme) -> &'static str {
     match theme {

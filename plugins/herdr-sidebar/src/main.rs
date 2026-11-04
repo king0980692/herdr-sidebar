@@ -50,6 +50,22 @@ fn main() -> std::io::Result<()> {
         }
         Some("--refresh-sidebars") => return herdr_sidebar::updates::refresh(),
         Some("--autoclose") => return ensure::autoclose(),
+        // Debug aid: what the Usage view would show, as text.
+        Some("--usage") => {
+            for provider in herdr_sidebar::usage::fetch_all() {
+                println!("{} {}", provider.name, provider.plan.unwrap_or_default());
+                if let Some(err) = provider.error {
+                    println!("  ! {err}");
+                }
+                for w in provider.windows {
+                    println!(
+                        "  {:<16} {:>5.1}%  resets_at={:?}  limited={}",
+                        w.label, w.used, w.resets_at, w.limited
+                    );
+                }
+            }
+            return Ok(());
+        }
         Some("--serve-site") => {
             let args: Vec<String> = std::env::args().skip(2).collect();
             let [file, bind_ip] = args.as_slice() else {
@@ -298,6 +314,7 @@ fn main() -> std::io::Result<()> {
             .then_some(false)
     };
     let mut quick_open_on_open = initial_activity == Some(ensure::Target::QuickOpen);
+    let mut usage_on_open = false;
     let result = loop {
         let exit = match view {
             View::Explorer => run_explorer(
@@ -306,6 +323,7 @@ fn main() -> std::io::Result<()> {
                 &mut roots,
                 std::mem::take(&mut search_on_open),
                 std::mem::take(&mut quick_open_on_open),
+                std::mem::take(&mut usage_on_open),
             ),
             View::SourceControl => run_scm(&mut terminal, Rc::clone(&cwd_follower), &mut roots),
         };
@@ -325,6 +343,10 @@ fn main() -> std::io::Result<()> {
             Ok(Exit::QuickOpen) => {
                 view = View::Explorer;
                 quick_open_on_open = true;
+            }
+            Ok(Exit::Usage) => {
+                view = View::Explorer;
+                usage_on_open = true;
             }
             Err(e) => {
                 roots.flush();
@@ -537,6 +559,7 @@ fn run_explorer(
     roots: &mut RootMemory,
     search_on_open: Option<bool>,
     quick_open_on_open: bool,
+    usage_on_open: bool,
 ) -> std::io::Result<Exit> {
     let mut app = explorer_app::App::new(roots.root.clone(), cwd_follower);
     if let Some(focus_query) = search_on_open {
@@ -544,6 +567,9 @@ fn run_explorer(
     }
     if quick_open_on_open {
         app.open_quick_open();
+    }
+    if usage_on_open {
+        app.open_usage();
     }
     loop {
         terminal.draw(|frame| app.draw(frame))?;

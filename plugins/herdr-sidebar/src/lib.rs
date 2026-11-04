@@ -28,5 +28,6 @@ pub mod tree;
 pub mod ui;
 pub mod updates;
 pub mod upload;
+pub mod usage;
 pub mod viewer;
 pub mod wrap;

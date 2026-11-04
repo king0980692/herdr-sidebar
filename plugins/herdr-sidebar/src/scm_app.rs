@@ -811,6 +811,7 @@ struct ClickZones {
     explorer: (u16, u16),
     search: (u16, u16),
     source_control: (u16, u16),
+    usage: (u16, u16),
     /// The ⚙ button (activity bar in unified mode, header otherwise).
     gear: Rect,
     message: Rect,
@@ -1644,7 +1645,7 @@ impl App {
             _ => None,
         };
         let keyboard_view = match key.code {
-            KeyCode::Char(c @ ('1' | '2' | '3'))
+            KeyCode::Char(c @ ('1' | '2' | '3' | '4'))
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
             {
@@ -1657,6 +1658,7 @@ impl App {
             return match c {
                 '1' => self.switch_to(View::Explorer),
                 '2' => self.open_search(false),
+                '4' => self.open_usage(),
                 _ => self.switch_to(View::SourceControl),
             };
         }
@@ -1768,6 +1770,7 @@ impl App {
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => return self.open_search(false),
             KeyCode::Char('3') => return self.switch_to(View::SourceControl),
+            KeyCode::Char('4') => return self.open_usage(),
             _ => {}
         }
         None
@@ -1815,6 +1818,9 @@ impl App {
             }
             if hits_activity_button(z.search, z.activity_row, x, y) {
                 return self.open_search(false);
+            }
+            if hits_activity_button(z.usage, z.activity_row, x, y) {
+                return self.open_usage();
             }
             if hits_activity_button(z.source_control, z.activity_row, x, y) {
                 return self.switch_to(View::SourceControl);
@@ -3515,6 +3521,18 @@ impl App {
         Some(Exit::Switch)
     }
 
+    /// The Usage view lives in the Explorer: hand the pane over to it open.
+    fn open_usage(&mut self) -> Option<Exit> {
+        if !self.merged() {
+            return None;
+        }
+        self.sidebar_state = sidebar::update_state(|state| {
+            state.active = View::Explorer;
+            state.search_active = false;
+        });
+        Some(Exit::Usage)
+    }
+
     fn open_search(&mut self, focus_query: bool) -> Option<Exit> {
         if !self.merged() {
             return None;
@@ -4173,6 +4191,7 @@ impl App {
         let outer_bottom = area.y + 2;
         let area = Rect::new(area.x, area.y + 1, area.width, 1);
         let (exp_icon, search_icon, git_icon) = activity_icons(self.theme);
+        let usage_icon = herdr_sidebar::ui::usage_icon(self.theme);
         // Both FA glyphs (folder, code-fork) render two cells wide in the
         // non-Mono Nerd Font; reserve the second cell in each chip so the
         // highlights are equal-sized with centered icons.
@@ -4188,6 +4207,8 @@ impl App {
             Span::raw(format!(" {search_icon}{slack} ")),
             Span::raw(" "),
             Span::raw(format!(" {git_icon}{slack} ")),
+            Span::raw(" "),
+            Span::raw(format!(" {usage_icon}{slack} ")),
         ];
         // Hit zones from the actual span widths (emoji vs nerd-glyph widths differ).
         let mut x = area.x;
@@ -4201,6 +4222,7 @@ impl App {
         self.zones.explorer = bounds[1];
         self.zones.search = bounds[3];
         self.zones.source_control = bounds[5];
+        self.zones.usage = bounds[7];
         let hovered = |bounds| {
             self.mouse_pos
                 .is_some_and(|(x, y)| hits_activity_button(bounds, area.y, x, y))
@@ -4208,9 +4230,11 @@ impl App {
         let explorer_hovered = hovered(bounds[1]);
         let search_hovered = hovered(bounds[3]);
         let git_hovered = hovered(bounds[5]);
+        let usage_hovered = hovered(bounds[7]);
         spans[1].style = activity_button_style(false, explorer_hovered);
         spans[3].style = activity_button_style(false, search_hovered);
         spans[5].style = activity_button_style(true, git_hovered);
+        spans[7].style = activity_button_style(false, usage_hovered);
         draw_activity_caps(
             frame,
             bounds[5],
@@ -4218,9 +4242,11 @@ impl App {
             outer_bottom,
             palette().selection_bg,
         );
-        for (is_hovered, button_bounds) in
-            [(explorer_hovered, bounds[1]), (search_hovered, bounds[3])]
-        {
+        for (is_hovered, button_bounds) in [
+            (explorer_hovered, bounds[1]),
+            (search_hovered, bounds[3]),
+            (usage_hovered, bounds[7]),
+        ] {
             if is_hovered {
                 draw_activity_caps(
                     frame,

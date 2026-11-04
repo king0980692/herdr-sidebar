@@ -216,6 +216,9 @@ enum Overlay {
         rect: Rect,
         scroll: usize,
     },
+    /// The Usage view (`4`): subscription limits of the coding agents. Like
+    /// Search it replaces the tree rather than floating over it.
+    Usage,
     QuickOpen {
         query: String,
         files: std::sync::Arc<Vec<QuickFile>>,
@@ -356,6 +359,11 @@ pub struct App {
     notice: Option<String>,
     /// Active `/` find, highlighted until Esc.
     find: Option<FindState>,
+    /// The Usage view's last answer and when it arrived, the fetch in flight,
+    /// and the view's scroll offset.
+    usage: Option<(Vec<herdr_sidebar::usage::Provider>, std::time::Instant)>,
+    usage_rx: Option<std::sync::mpsc::Receiver<Vec<herdr_sidebar::usage::Provider>>>,
+    usage_scroll: usize,
     /// The header's path: `<repo>/<path inside it>` in a git project, else
     /// the `~`-abbreviated path. Set per root, so a followed `cd` (which
     /// re-roots through `App::new`) updates it.
@@ -456,6 +464,7 @@ struct ActivityZones {
     explorer: (u16, u16),
     search: (u16, u16),
     source_control: (u16, u16),
+    usage: (u16, u16),
 }
 
 impl Default for ActivityZones {
@@ -466,6 +475,7 @@ impl Default for ActivityZones {
             explorer: (0, 0),
             search: (0, 0),
             source_control: (0, 0),
+            usage: (0, 0),
         }
     }
 }
@@ -535,6 +545,9 @@ impl App {
             suspended_search: None,
             notice: None,
             find: None,
+            usage: None,
+            usage_rx: None,
+            usage_scroll: 0,
             header_path: header,
             site_servers: HashMap::new(),
             marquee_selected: None,
@@ -597,6 +610,7 @@ impl App {
         self.sync_shared_settings();
         self.sync_shared_tree();
         self.collect_quick_index();
+        self.collect_usage();
         self.collect_uploads();
         self.collect_content_search();
         self.collect_git_sync();
@@ -1226,13 +1240,14 @@ impl App {
             _ => None,
         };
         if let Some(c) = injected_view.or(match key.code {
-            KeyCode::Char(c @ ('1' | '2' | '3')) => Some(c),
+            KeyCode::Char(c @ ('1' | '2' | '3' | '4')) => Some(c),
             _ => None,
         }) {
             let ctrl = injected_view.is_some()
                 || (key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT));
-            let bare_switch = key.modifiers.is_empty() && self.search_text_unfocused();
+            let bare_switch = key.modifiers.is_empty()
+                && (self.search_text_unfocused() || matches!(self.overlay, Some(Overlay::Usage)));
             if ctrl || bare_switch {
                 if ctrl {
                     self.overlay = None;
@@ -1242,7 +1257,11 @@ impl App {
                     '1' => {
                         // Explorer is this app's own tree: dropping the search
                         // overlay lands on it in-process.
-                        if matches!(self.overlay, Some(Overlay::ContentSearch { .. })) || ctrl {
+                        if matches!(
+                            self.overlay,
+                            Some(Overlay::ContentSearch { .. } | Overlay::Usage)
+                        ) || ctrl
+                        {
                             self.overlay = None;
                             if self.merged() {
                                 self.sidebar_state = sidebar::update_state(|state| {
@@ -1254,6 +1273,10 @@ impl App {
                     }
                     '2' => {
                         self.open_content_search(false);
+                        None
+                    }
+                    '4' => {
+                        self.open_usage();
                         None
                     }
                     _ => self.switch_to(View::SourceControl),
@@ -1354,6 +1377,7 @@ impl App {
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => self.open_content_search(false),
             KeyCode::Char('3') => return self.switch_to(View::SourceControl),
+            KeyCode::Char('4') => self.open_usage(),
             _ => {}
         }
         None
@@ -1365,7 +1389,12 @@ impl App {
         // hover title-bar buttons until the linger expires.
         self.last_mouse = Some(std::time::Instant::now());
         self.mouse_pos = Some((mouse.column, mouse.row));
-        if self.overlay.is_some() && !matches!(self.overlay, Some(Overlay::ContentSearch { .. })) {
+        if self.overlay.is_some()
+            && !matches!(
+                self.overlay,
+                Some(Overlay::ContentSearch { .. } | Overlay::Usage)
+            )
+        {
             self.overlay_mouse(mouse);
             return None;
         }
@@ -1383,6 +1412,10 @@ impl App {
                 }
                 if hits_activity_button(zones.source_control, zones.row, mouse.column, mouse.row) {
                     return self.switch_to(View::SourceControl);
+                }
+                if hits_activity_button(zones.usage, zones.row, mouse.column, mouse.row) {
+                    self.open_usage();
+                    return None;
                 }
             }
             let gear = self.gear;
@@ -1413,6 +1446,24 @@ impl App {
                 return None;
             }
             self.search_mouse(mouse);
+            return None;
+        }
+        if matches!(self.overlay, Some(Overlay::Usage)) {
+            match mouse.kind {
+                MouseEventKind::ScrollDown => self.usage_scroll += 3,
+                MouseEventKind::ScrollUp => self.usage_scroll = self.usage_scroll.saturating_sub(3),
+                MouseEventKind::Down(MouseButton::Left)
+                    if hits_collapse_button(
+                        mouse.column,
+                        mouse.row,
+                        self.last_width,
+                        self.last_height,
+                    ) =>
+                {
+                    self.hide();
+                }
+                _ => {}
+            }
             return None;
         }
         match mouse.kind {
@@ -1600,6 +1651,8 @@ impl App {
             ToggleSetting(usize),
             AdjustWidth(bool),
             DeleteConfirmed(PathBuf, bool),
+            UsageRefresh,
+            UsageScroll(isize),
             Picker(PickerAction),
         }
         let settings = self.settings_rows();
@@ -1913,6 +1966,16 @@ impl App {
                     }
                 }
             }
+            Some(Overlay::Usage) => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => Cmd::Close,
+                KeyCode::Char('r') => Cmd::UsageRefresh,
+                KeyCode::Down | KeyCode::Char('j') => Cmd::UsageScroll(1),
+                KeyCode::Up | KeyCode::Char('k') => Cmd::UsageScroll(-1),
+                KeyCode::PageDown => Cmd::UsageScroll(10),
+                KeyCode::PageUp => Cmd::UsageScroll(-10),
+                KeyCode::Home | KeyCode::Char('g') => Cmd::UsageScroll(-10_000),
+                _ => Cmd::Nothing,
+            },
             Some(Overlay::ConfirmDelete { path, is_dir }) => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     Cmd::DeleteConfirmed(path.clone(), *is_dir)
@@ -1944,6 +2007,10 @@ impl App {
             }
             Cmd::ToggleSetting(index) => self.toggle_setting(index),
             Cmd::AdjustWidth(wider) => self.adjust_sidebar_width(wider),
+            Cmd::UsageRefresh => self.fetch_usage(),
+            Cmd::UsageScroll(delta) => {
+                self.usage_scroll = self.usage_scroll.saturating_add_signed(delta);
+            }
             Cmd::DeleteConfirmed(path, is_dir) => {
                 self.overlay = None;
                 match actions::delete(&path, is_dir) {
@@ -3483,6 +3550,105 @@ impl App {
         }
     }
 
+    /// `4` / the activity bar: show the Usage view, fetching if what we have
+    /// is missing or older than [`USAGE_REFRESH`].
+    pub fn open_usage(&mut self) {
+        if !matches!(self.overlay, Some(Overlay::Usage)) {
+            self.overlay = Some(Overlay::Usage);
+            self.usage_scroll = 0;
+        }
+        if self
+            .usage
+            .as_ref()
+            .is_none_or(|(_, at)| at.elapsed() >= USAGE_REFRESH)
+        {
+            self.fetch_usage();
+        }
+    }
+
+    /// Start a background fetch unless one is already running.
+    fn fetch_usage(&mut self) {
+        if self.usage_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(herdr_sidebar::usage::fetch_all());
+        });
+        self.usage_rx = Some(rx);
+    }
+
+    /// Tick: take a finished fetch, and keep an open Usage view fresh.
+    fn collect_usage(&mut self) {
+        if let Some(rx) = &self.usage_rx {
+            match rx.try_recv() {
+                Ok(providers) => {
+                    self.usage = Some((providers, std::time::Instant::now()));
+                    self.usage_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.usage_rx = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if matches!(self.overlay, Some(Overlay::Usage))
+            && self
+                .usage
+                .as_ref()
+                .is_some_and(|(_, at)| at.elapsed() >= USAGE_REFRESH)
+        {
+            self.fetch_usage();
+        }
+    }
+
+    fn draw_usage(&mut self, frame: &mut Frame, area: Rect) {
+        let width = area.width as usize;
+        let mut lines: Vec<Line> = Vec::new();
+        let status = match (&self.usage, self.usage_rx.is_some()) {
+            (_, true) => "updating…".to_string(),
+            (Some((_, at)), false) => {
+                format!("{} ago", short_duration(at.elapsed().as_secs() as i64))
+            }
+            (None, false) => String::new(),
+        };
+        let title = " USAGE";
+        let pad = width.saturating_sub(title.len() + status.chars().count() + 1);
+        lines.push(Line::from(vec![
+            Span::styled(title, Style::default().bold().fg(palette().header_accent)),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(status, Style::default().dim()),
+        ]));
+        match &self.usage {
+            None => {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    "  fetching usage…",
+                    Style::default().dim().italic(),
+                ));
+            }
+            Some((providers, _)) if providers.is_empty() => {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    "  no signed-in agents found",
+                    Style::default().dim().italic(),
+                ));
+            }
+            Some((providers, _)) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                for provider in providers {
+                    lines.push(Line::raw(""));
+                    lines.extend(usage_card(provider, width, now));
+                }
+            }
+        }
+        let max_scroll = lines.len().saturating_sub(area.height as usize);
+        self.usage_scroll = self.usage_scroll.min(max_scroll);
+        let visible: Vec<Line> = lines.into_iter().skip(self.usage_scroll).collect();
+        frame.render_widget(Paragraph::new(visible), area);
+    }
+
     fn selected_row(&self) -> Option<&Row> {
         self.rows.get(self.selected?)
     }
@@ -3617,7 +3783,7 @@ impl App {
         // the pane label ("Explorer"/"Sidebar") — a second border read as a
         // double frame.
         let search_active = matches!(self.overlay, Some(Overlay::ContentSearch { .. }));
-        let footer_height = if search_active {
+        let footer_height = if search_active || matches!(self.overlay, Some(Overlay::Usage)) {
             1
         } else {
             self.footer_height(frame.area().width)
@@ -3636,6 +3802,27 @@ impl App {
 
         if self.merged() {
             self.draw_activity_bar(frame, activity);
+        }
+        if matches!(self.overlay, Some(Overlay::Usage)) {
+            let area = Rect::new(
+                header.x,
+                header.y,
+                header.width,
+                header.height.saturating_add(body.height),
+            );
+            self.draw_usage(frame, area);
+            let [hint, button] =
+                Layout::horizontal([Constraint::Min(0), Constraint::Length(3)]).areas(footer);
+            frame.render_widget(
+                Paragraph::new(" r refresh · j/k scroll · esc back".dim()),
+                hint,
+            );
+            frame.render_widget(
+                Paragraph::new("«".bold().fg(palette().header_accent)).alignment(Alignment::Center),
+                button,
+            );
+            self.body = BodyGeom::default();
+            return;
         }
         if search_active {
             let search_area = Rect::new(
@@ -3932,6 +4119,7 @@ impl App {
             ("c", "folder"),
             ("/", "find"),
             ("e", "edit"),
+            ("4", "usage"),
             ("a", "new"),
             ("R", "rename"),
             ("dd", "delete"),
@@ -3998,7 +4186,9 @@ impl App {
         let outer_bottom = area.y + 2;
         let area = Rect::new(area.x, area.y + 1, area.width, 1);
         let (exp_icon, search_icon, git_icon) = activity_icons(self.theme);
+        let usage_icon = herdr_sidebar::ui::usage_icon(self.theme);
         let search_active = matches!(self.overlay, Some(Overlay::ContentSearch { .. }));
+        let usage_active = matches!(self.overlay, Some(Overlay::Usage));
         // Both FA glyphs (folder, code-fork) render two cells wide in the
         // non-Mono Nerd Font; reserve the second cell in each chip so the
         // highlights are equal-sized with centered icons.
@@ -4014,6 +4204,8 @@ impl App {
             Span::raw(format!(" {search_icon}{slack} ")),
             Span::raw(" "),
             Span::raw(format!(" {git_icon}{slack} ")),
+            Span::raw(" "),
+            Span::raw(format!(" {usage_icon}{slack} ")),
         ];
         // Hit zones from the actual span widths (emoji vs nerd-glyph widths differ).
         let mut x = area.x;
@@ -4028,6 +4220,7 @@ impl App {
             explorer: bounds[1],
             search: bounds[3],
             source_control: bounds[5],
+            usage: bounds[7],
         };
         let hovered = |bounds| {
             self.mouse_pos
@@ -4036,10 +4229,19 @@ impl App {
         let explorer_hovered = hovered(bounds[1]);
         let search_hovered = hovered(bounds[3]);
         let git_hovered = hovered(bounds[5]);
-        spans[1].style = activity_button_style(!search_active, explorer_hovered);
+        let usage_hovered = hovered(bounds[7]);
+        let explorer_active = !search_active && !usage_active;
+        spans[1].style = activity_button_style(explorer_active, explorer_hovered);
         spans[3].style = activity_button_style(search_active, search_hovered);
         spans[5].style = activity_button_style(false, git_hovered);
-        let (chip_start, chip_end) = if search_active { bounds[3] } else { bounds[1] };
+        spans[7].style = activity_button_style(usage_active, usage_hovered);
+        let (chip_start, chip_end) = if search_active {
+            bounds[3]
+        } else if usage_active {
+            bounds[7]
+        } else {
+            bounds[1]
+        };
         draw_activity_caps(
             frame,
             (chip_start, chip_end),
@@ -4048,9 +4250,10 @@ impl App {
             palette().selection_bg,
         );
         for (active, is_hovered, button_bounds) in [
-            (!search_active, explorer_hovered, bounds[1]),
+            (explorer_active, explorer_hovered, bounds[1]),
             (search_active, search_hovered, bounds[3]),
             (false, git_hovered, bounds[5]),
+            (usage_active, usage_hovered, bounds[7]),
         ] {
             if !active && is_hovered {
                 draw_activity_caps(
@@ -5290,6 +5493,144 @@ fn truncate_left(s: &str, max: usize) -> String {
         used += w;
     }
     std::iter::once('…').chain(tail.into_iter().rev()).collect()
+}
+
+/// How long the Usage view trusts an answer before fetching again.
+const USAGE_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `90s` → `1m`, `7500s` → `2h 5m`, `360000s` → `4d 4h`.
+fn short_duration(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h {}m", secs / 3600, secs % 3600 / 60)
+    } else {
+        format!("{}d {}h", secs / 86_400, secs % 86_400 / 3600)
+    }
+}
+
+/// Severity colour for a used percentage (or an exhausted window).
+fn usage_color(used: f64, limited: bool) -> Color {
+    if limited || used >= 95.0 {
+        palette().deleted
+    } else if used >= 80.0 {
+        Color::Indexed(208)
+    } else if used >= 50.0 {
+        palette().modified
+    } else {
+        palette().added
+    }
+}
+
+/// A `cells`-wide bar: the used part solid (eighth-blocks for the fraction),
+/// the rest light; `pace` marks where an even pace would be by now.
+fn usage_bar(used: f64, cells: usize, color: Color, pace: Option<f64>) -> Vec<Span<'static>> {
+    const EIGHTHS: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+    let exact = used.clamp(0.0, 100.0) / 100.0 * cells as f64;
+    let full = (exact.floor() as usize).min(cells);
+    let part = ((exact - full as f64) * 8.0).floor() as usize;
+    let pace_cell = pace.map(|p| ((p.clamp(0.0, 100.0) / 100.0) * cells as f64) as usize);
+    let mut spans = vec![Span::styled("█".repeat(full), Style::default().fg(color))];
+    let mut used_cells = full;
+    if part > 0 && used_cells < cells {
+        spans.push(Span::styled(EIGHTHS[part], Style::default().fg(color)));
+        used_cells += 1;
+    }
+    for cell in used_cells..cells {
+        if Some(cell) == pace_cell {
+            spans.push(Span::styled(
+                "│",
+                Style::default().fg(palette().header_accent),
+            ));
+        } else {
+            spans.push(Span::styled("░", Style::default().dim()));
+        }
+    }
+    spans
+}
+
+/// One provider's card: name and plan, then per window its label and
+/// percentage, a full-width bar, and when it resets (and the even pace).
+fn usage_card(
+    provider: &herdr_sidebar::usage::Provider,
+    width: usize,
+    now: i64,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(vec![
+        Span::raw(" "),
+        Span::styled(provider.name, Style::default().bold()),
+        Span::styled(
+            provider
+                .plan
+                .as_deref()
+                .map(|p| format!("  {p}"))
+                .unwrap_or_default(),
+            Style::default().dim(),
+        ),
+    ])];
+    if let Some(err) = &provider.error {
+        lines.push(Line::styled(
+            format!("  ! {err}"),
+            Style::default().fg(palette().deleted),
+        ));
+    }
+    let bar_cells = width.saturating_sub(3).max(4);
+    for w in &provider.windows {
+        let color = usage_color(w.used, w.limited);
+        let pct = format!("{:.0}%", w.used);
+        let label = truncate_to(w.label.clone(), width.saturating_sub(pct.len() + 4));
+        let pad = width.saturating_sub(2 + Span::raw(label.as_str()).width() + pct.len() + 1);
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::raw(label),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(pct, Style::default().fg(color).bold()),
+        ]));
+        // Where an even pace would be by now, when the window's length is known.
+        let pace = match (w.resets_at, w.length_secs) {
+            (Some(reset), Some(len)) if len > 0 => {
+                Some((1.0 - (reset - now) as f64 / len as f64).clamp(0.0, 1.0) * 100.0)
+            }
+            _ => None,
+        };
+        let mut bar = vec![Span::raw("  ")];
+        bar.extend(usage_bar(w.used, bar_cells, color, pace));
+        lines.push(Line::from(bar));
+        let mut detail = Vec::new();
+        if w.limited {
+            detail.push(Span::styled(
+                "limit reached · ",
+                Style::default().fg(palette().deleted).bold(),
+            ));
+        }
+        if let Some(reset) = w.resets_at {
+            detail.push(Span::styled(
+                format!("↻ {}", short_duration(reset - now)),
+                Style::default().dim(),
+            ));
+        }
+        if let Some(p) = pace
+            && !w.limited
+        {
+            let ahead = w.used > p + 5.0;
+            detail.push(Span::styled(
+                format!(" · pace {p:.0}%"),
+                if ahead {
+                    Style::default().fg(Color::Indexed(208))
+                } else {
+                    Style::default().dim()
+                },
+            ));
+        }
+        if !detail.is_empty() {
+            detail.insert(0, Span::raw("  "));
+            lines.push(Line::from(detail));
+        }
+    }
+    lines
 }
 
 /// Keep a marquee's start time while the same row stays active; restart it

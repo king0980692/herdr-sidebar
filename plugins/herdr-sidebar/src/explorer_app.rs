@@ -5661,6 +5661,12 @@ fn usage_card(
             .bold(),
     ));
     let mut lines = vec![Line::from(head)];
+    if let Some(account) = &provider.account {
+        lines.push(Line::styled(
+            format!(" {}", truncate_to(account.clone(), width.saturating_sub(2))),
+            Style::default().dim(),
+        ));
+    }
     if let Some(err) = &provider.error {
         lines.push(Line::styled(
             format!("  ! {err}"),

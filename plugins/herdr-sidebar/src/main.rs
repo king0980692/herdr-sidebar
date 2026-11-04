@@ -53,7 +53,12 @@ fn main() -> std::io::Result<()> {
         // Debug aid: what the Usage view would show, as text.
         Some("--usage") => {
             for provider in herdr_sidebar::usage::fetch_all() {
-                println!("{} {}", provider.name, provider.plan.unwrap_or_default());
+                println!(
+                    "{} {} {}",
+                    provider.name,
+                    provider.plan.unwrap_or_default(),
+                    provider.account.unwrap_or_default()
+                );
                 if let Some(err) = provider.error {
                     println!("  ! {err}");
                 }

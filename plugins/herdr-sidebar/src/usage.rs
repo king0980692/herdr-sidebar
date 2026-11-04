@@ -40,6 +40,8 @@ pub struct Window {
 pub struct Provider {
     pub name: &'static str,
     pub plan: Option<String>,
+    /// The signed-in account (an email), when the provider tells us.
+    pub account: Option<String>,
     pub windows: Vec<Window>,
     /// Shown instead of (or under) the windows when fetching failed.
     pub error: Option<String>,
@@ -221,9 +223,16 @@ fn claude() -> Option<Provider> {
         note = Some(text);
     }
     let windows = body.as_ref().map(claude_windows).unwrap_or_default();
+    // Claude Code keeps the signed-in account in ~/.claude.json.
+    let account = read_json(home().join(".claude.json")).and_then(|c| {
+        c["oauthAccount"]["emailAddress"]
+            .as_str()
+            .map(str::to_string)
+    });
     Some(Provider {
         name: "Claude",
         plan,
+        account,
         error: error.or_else(|| body.is_none().then(|| "no usage data yet".into())),
         note,
         windows,
@@ -360,6 +369,10 @@ fn codex() -> Option<Provider> {
             .as_ref()
             .and_then(|b| b["plan_type"].as_str())
             .map(capitalize),
+        account: body
+            .as_ref()
+            .and_then(|b| b["email"].as_str())
+            .map(str::to_string),
         windows: body.as_ref().map(codex_windows).unwrap_or_default(),
         error,
         note,
@@ -420,6 +433,8 @@ fn opencode_go() -> Option<Provider> {
     Some(Provider {
         name: "OpenCode Go",
         plan: None,
+        // Neither the API nor the key file says whose key it is.
+        account: None,
         windows: body.as_ref().map(opencode_windows).unwrap_or_default(),
         error,
         note,

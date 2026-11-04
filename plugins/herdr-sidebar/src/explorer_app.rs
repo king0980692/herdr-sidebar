@@ -1226,7 +1226,7 @@ impl App {
             return None;
         }
         // View switching from the keyboard, VS Code's activity-bar order:
-        // 1 Explorer, 2 Search, 3 Source Control. Ctrl+1/2/3 always switch (an
+        // 1 Explorer, 2 Usage, 3 Source Control, 4 Search. Ctrl+1/2/3 always switch (an
         // editor's group-focus chord), so they work even mid-word in a focused
         // search field. Bare 1/2/3 ALSO switch while the Search box is NOT
         // focused (its Results list) — the state you land in when switching to
@@ -1272,11 +1272,11 @@ impl App {
                         self.switch_to(View::Explorer)
                     }
                     '2' => {
-                        self.open_content_search(false);
+                        self.open_usage();
                         None
                     }
                     '4' => {
-                        self.open_usage();
+                        self.open_content_search(false);
                         None
                     }
                     _ => self.switch_to(View::SourceControl),
@@ -1375,9 +1375,9 @@ impl App {
             KeyCode::Char('m') => self.open_menu_for_selection(),
             KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
-            KeyCode::Char('2') => self.open_content_search(false),
+            KeyCode::Char('2') => self.open_usage(),
             KeyCode::Char('3') => return self.switch_to(View::SourceControl),
-            KeyCode::Char('4') => self.open_usage(),
+            KeyCode::Char('4') => self.open_content_search(false),
             _ => {}
         }
         None
@@ -4119,7 +4119,6 @@ impl App {
             ("c", "folder"),
             ("/", "find"),
             ("e", "edit"),
-            ("4", "usage"),
             ("a", "new"),
             ("R", "rename"),
             ("dd", "delete"),
@@ -4132,7 +4131,12 @@ impl App {
             ("q", "quit"),
         ];
         if self.merged() {
-            hints.extend([("1", "files"), ("2", "search"), ("3", "git")]);
+            hints.extend([
+                ("1", "files"),
+                ("2", "usage"),
+                ("3", "git"),
+                ("4", "search"),
+            ]);
         }
         hints
     }
@@ -4201,11 +4205,11 @@ impl App {
             Span::raw(" "),
             Span::raw(format!(" {exp_icon}{slack} ")),
             Span::raw(" "),
-            Span::raw(format!(" {search_icon}{slack} ")),
+            Span::raw(format!(" {usage_icon}{slack} ")),
             Span::raw(" "),
             Span::raw(format!(" {git_icon}{slack} ")),
             Span::raw(" "),
-            Span::raw(format!(" {usage_icon}{slack} ")),
+            Span::raw(format!(" {search_icon}{slack} ")),
         ];
         // Hit zones from the actual span widths (emoji vs nerd-glyph widths differ).
         let mut x = area.x;
@@ -4218,27 +4222,27 @@ impl App {
         self.activity = ActivityZones {
             row: area.y,
             explorer: bounds[1],
-            search: bounds[3],
+            search: bounds[7],
             source_control: bounds[5],
-            usage: bounds[7],
+            usage: bounds[3],
         };
         let hovered = |bounds| {
             self.mouse_pos
                 .is_some_and(|(x, y)| hits_activity_button(bounds, area.y, x, y))
         };
         let explorer_hovered = hovered(bounds[1]);
-        let search_hovered = hovered(bounds[3]);
+        let search_hovered = hovered(bounds[7]);
         let git_hovered = hovered(bounds[5]);
-        let usage_hovered = hovered(bounds[7]);
+        let usage_hovered = hovered(bounds[3]);
         let explorer_active = !search_active && !usage_active;
         spans[1].style = activity_button_style(explorer_active, explorer_hovered);
-        spans[3].style = activity_button_style(search_active, search_hovered);
+        spans[7].style = activity_button_style(search_active, search_hovered);
         spans[5].style = activity_button_style(false, git_hovered);
-        spans[7].style = activity_button_style(usage_active, usage_hovered);
+        spans[3].style = activity_button_style(usage_active, usage_hovered);
         let (chip_start, chip_end) = if search_active {
-            bounds[3]
-        } else if usage_active {
             bounds[7]
+        } else if usage_active {
+            bounds[3]
         } else {
             bounds[1]
         };
@@ -4251,9 +4255,9 @@ impl App {
         );
         for (active, is_hovered, button_bounds) in [
             (explorer_active, explorer_hovered, bounds[1]),
-            (search_active, search_hovered, bounds[3]),
+            (search_active, search_hovered, bounds[7]),
             (false, git_hovered, bounds[5]),
-            (usage_active, usage_hovered, bounds[7]),
+            (usage_active, usage_hovered, bounds[3]),
         ] {
             if !active && is_hovered {
                 draw_activity_caps(

@@ -1636,7 +1636,7 @@ impl App {
         }
         // View switching has to reach past the commit message box, where bare
         // 1/2/3 type into the draft — Ctrl+1/2/3 mirror VS Code's activity bar
-        // from any focus (1 Explorer, 2 Search, 3 Source Control). Bare 1/2/3
+        // from any focus (1 Explorer, 2 Usage, 3 Source Control, 4 Search). Bare 1/2/3
         // still switch from the file list.
         let injected_view = match key.code {
             KeyCode::F(9) => Some('1'),
@@ -1657,8 +1657,8 @@ impl App {
             self.overlay = None;
             return match c {
                 '1' => self.switch_to(View::Explorer),
-                '2' => self.open_search(false),
-                '4' => self.open_usage(),
+                '2' => self.open_usage(),
+                '4' => self.open_search(false),
                 _ => self.switch_to(View::SourceControl),
             };
         }
@@ -1768,9 +1768,9 @@ impl App {
             KeyCode::Char('m') => self.open_menu_for_selection(),
             KeyCode::Char('b') => self.hide(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
-            KeyCode::Char('2') => return self.open_search(false),
+            KeyCode::Char('2') => return self.open_usage(),
             KeyCode::Char('3') => return self.switch_to(View::SourceControl),
-            KeyCode::Char('4') => return self.open_usage(),
+            KeyCode::Char('4') => return self.open_search(false),
             _ => {}
         }
         None
@@ -4204,11 +4204,11 @@ impl App {
             Span::raw(" "),
             Span::raw(format!(" {exp_icon}{slack} ")),
             Span::raw(" "),
-            Span::raw(format!(" {search_icon}{slack} ")),
+            Span::raw(format!(" {usage_icon}{slack} ")),
             Span::raw(" "),
             Span::raw(format!(" {git_icon}{slack} ")),
             Span::raw(" "),
-            Span::raw(format!(" {usage_icon}{slack} ")),
+            Span::raw(format!(" {search_icon}{slack} ")),
         ];
         // Hit zones from the actual span widths (emoji vs nerd-glyph widths differ).
         let mut x = area.x;
@@ -4220,21 +4220,21 @@ impl App {
         }
         self.zones.activity_row = area.y;
         self.zones.explorer = bounds[1];
-        self.zones.search = bounds[3];
+        self.zones.search = bounds[7];
         self.zones.source_control = bounds[5];
-        self.zones.usage = bounds[7];
+        self.zones.usage = bounds[3];
         let hovered = |bounds| {
             self.mouse_pos
                 .is_some_and(|(x, y)| hits_activity_button(bounds, area.y, x, y))
         };
         let explorer_hovered = hovered(bounds[1]);
-        let search_hovered = hovered(bounds[3]);
+        let search_hovered = hovered(bounds[7]);
         let git_hovered = hovered(bounds[5]);
-        let usage_hovered = hovered(bounds[7]);
+        let usage_hovered = hovered(bounds[3]);
         spans[1].style = activity_button_style(false, explorer_hovered);
-        spans[3].style = activity_button_style(false, search_hovered);
+        spans[7].style = activity_button_style(false, search_hovered);
         spans[5].style = activity_button_style(true, git_hovered);
-        spans[7].style = activity_button_style(false, usage_hovered);
+        spans[3].style = activity_button_style(false, usage_hovered);
         draw_activity_caps(
             frame,
             bounds[5],
@@ -4244,8 +4244,8 @@ impl App {
         );
         for (is_hovered, button_bounds) in [
             (explorer_hovered, bounds[1]),
-            (search_hovered, bounds[3]),
-            (usage_hovered, bounds[7]),
+            (search_hovered, bounds[7]),
+            (usage_hovered, bounds[3]),
         ] {
             if is_hovered {
                 draw_activity_caps(
@@ -4821,7 +4821,12 @@ impl App {
             ("q", "quit"),
         ];
         if self.merged() {
-            hints.extend([("1", "files"), ("2", "search"), ("3", "git")]);
+            hints.extend([
+                ("1", "files"),
+                ("2", "usage"),
+                ("3", "git"),
+                ("4", "search"),
+            ]);
         }
         hints
     }

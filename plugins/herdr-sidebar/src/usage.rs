@@ -52,10 +52,10 @@ pub struct Provider {
 /// Every configured provider, fetched now. Slow (network): run it off the
 /// UI thread.
 pub fn fetch_all() -> Vec<Provider> {
-    [claude(), codex(), opencode_go()]
-        .into_iter()
-        .flatten()
-        .collect()
+    let mut all: Vec<Provider> = claude().into_iter().collect();
+    all.extend(codex());
+    all.extend(opencode_go());
+    all
 }
 
 fn home() -> PathBuf {
@@ -352,50 +352,107 @@ fn cached_get(
 
 // ---- Codex -------------------------------------------------------------
 
-fn codex() -> Option<Provider> {
-    let (token, account) = codex_auth()?;
-    let (body, error, note) = cached_get(
-        "codex",
-        "https://chatgpt.com/backend-api/wham/usage",
-        &[
-            format!("Authorization: Bearer {token}"),
-            format!("ChatGPT-Account-Id: {account}"),
-            "User-Agent: herdr-sidebar".into(),
-        ],
-    );
-    Some(Provider {
+/// One Codex login: its token, ChatGPT account id, where it came from, and
+/// (pi only) when its token expires, in unix ms.
+struct CodexLogin {
+    token: String,
+    account: String,
+    source: &'static str,
+    expires_ms: Option<i64>,
+}
+
+/// One card per Codex account, signed in through the Codex CLI and/or pi
+/// (each keeps its own login, which may be a different account).
+fn codex() -> Vec<Provider> {
+    let logins = codex_logins();
+    let several = logins.len() > 1;
+    logins
+        .into_iter()
+        .map(|login| {
+            let source = several.then_some(login.source);
+            // The sidebar never refreshes another tool's login, so an expired
+            // one just says where to renew it.
+            if login.expires_ms.is_some_and(|ms| ms / 1000 <= now()) {
+                return codex_card(
+                    None,
+                    Some(format!("token expired: open {} to renew it", login.source)),
+                    None,
+                    source,
+                );
+            }
+            let (body, error, note) = cached_get(
+                &format!("codex-{}", login.account),
+                "https://chatgpt.com/backend-api/wham/usage",
+                &[
+                    format!("Authorization: Bearer {}", login.token),
+                    format!("ChatGPT-Account-Id: {}", login.account),
+                    "User-Agent: herdr-sidebar".into(),
+                ],
+            );
+            codex_card(body, error, note, source)
+        })
+        .collect()
+}
+
+fn codex_card(
+    body: Option<Value>,
+    error: Option<String>,
+    note: Option<String>,
+    source: Option<&'static str>,
+) -> Provider {
+    let email = body
+        .as_ref()
+        .and_then(|b| b["email"].as_str())
+        .map(str::to_string);
+    Provider {
         name: "Codex",
         plan: body
             .as_ref()
             .and_then(|b| b["plan_type"].as_str())
             .map(capitalize),
-        account: body
-            .as_ref()
-            .and_then(|b| b["email"].as_str())
-            .map(str::to_string),
+        account: match (email, source) {
+            (Some(email), Some(source)) => Some(format!("{source} · {email}")),
+            (Some(email), None) => Some(email),
+            (None, Some(source)) => Some(format!("via {source}")),
+            (None, None) => None,
+        },
         windows: body.as_ref().map(codex_windows).unwrap_or_default(),
         error,
         note,
-    })
+    }
 }
 
-/// The Codex CLI's own tokens (it refreshes them while in use), else pi's.
-fn codex_auth() -> Option<(String, String)> {
+/// The Codex CLI's login and pi's, one per distinct account.
+fn codex_logins() -> Vec<CodexLogin> {
+    let mut logins = Vec::new();
     if let Some(auth) = read_json(home().join(".codex/auth.json")) {
         let tokens = &auth["tokens"];
         if let (Some(t), Some(a)) = (
             tokens["access_token"].as_str(),
             tokens["account_id"].as_str(),
         ) {
-            return Some((t.into(), a.into()));
+            logins.push(CodexLogin {
+                token: t.into(),
+                account: a.into(),
+                source: "codex cli",
+                expires_ms: None,
+            });
         }
     }
-    let pi = read_json(home().join(".pi/agent/auth.json"))?;
-    let entry = &pi["openai-codex"];
-    Some((
-        entry["access"].as_str()?.into(),
-        entry["accountId"].as_str()?.into(),
-    ))
+    if let Some(pi) = read_json(home().join(".pi/agent/auth.json")) {
+        let entry = &pi["openai-codex"];
+        if let (Some(t), Some(a)) = (entry["access"].as_str(), entry["accountId"].as_str())
+            && !logins.iter().any(|l| l.account == a)
+        {
+            logins.push(CodexLogin {
+                token: t.into(),
+                account: a.into(),
+                source: "pi",
+                expires_ms: entry["expires"].as_i64(),
+            });
+        }
+    }
+    logins
 }
 
 fn codex_windows(body: &Value) -> Vec<Window> {

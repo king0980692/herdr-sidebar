@@ -96,6 +96,10 @@ fn get(url: &str, headers: &[String]) -> Result<Value, String> {
         let err = err.trim().trim_start_matches("curl: ");
         return Err(if err.contains("401") || err.contains("403") {
             "not signed in (token expired?)".into()
+        } else if err.contains("429") {
+            "rate limited by the API: showing the last numbers".into()
+        } else if err.contains("(28)") || err.contains("(6)") || err.contains("(7)") {
+            "offline: showing the last numbers".into()
         } else if err.is_empty() {
             "request failed".into()
         } else {

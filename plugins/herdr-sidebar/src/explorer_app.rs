@@ -5577,6 +5577,9 @@ fn usage_card(
             Style::default().fg(palette().deleted),
         ));
     }
+    if let Some(note) = &provider.note {
+        lines.push(Line::styled(format!("  {note}"), Style::default().dim()));
+    }
     let bar_cells = width.saturating_sub(3).max(4);
     for w in &provider.windows {
         let color = usage_color(w.used, w.limited);

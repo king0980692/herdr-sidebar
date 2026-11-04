@@ -43,6 +43,8 @@ pub struct Provider {
     pub windows: Vec<Window>,
     /// Shown instead of (or under) the windows when fetching failed.
     pub error: Option<String>,
+    /// A calm, dim remark: e.g. the numbers are a few minutes old.
+    pub note: Option<String>,
 }
 
 /// Every configured provider, fetched now. Slow (network): run it off the
@@ -143,20 +145,47 @@ fn window_name(secs: i64) -> String {
 
 const CLAUDE_TTL: i64 = 60;
 
+/// Seconds since `path` was last modified, if it exists.
+fn age_secs(path: &std::path::Path) -> Option<i64> {
+    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    Some(modified.elapsed().map(|d| d.as_secs() as i64).unwrap_or(0))
+}
+
+/// `claude-usage.sh`'s shared backoff after a 429: `<until-epoch> <strikes>`.
+fn read_backoff(path: &std::path::Path) -> (i64, u32) {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut parts = text.split_whitespace();
+    let until = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let strikes = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    (until, strikes)
+}
+
+/// Back off 2m, 4m, 8m … up to 15m after the `strikes`-th 429 in a row.
+fn backoff_secs(strikes: u32) -> i64 {
+    (120_i64 << strikes.saturating_sub(1).min(4)).min(900)
+}
+
 fn claude() -> Option<Provider> {
     let creds = read_json(home().join(".claude/.credentials.json"))?;
     let oauth = &creds["claudeAiOauth"];
     let token = oauth["accessToken"].as_str()?.to_string();
     let plan = oauth["subscriptionType"].as_str().map(capitalize);
-    let cache = home().join(".cache/claude-usage/usage.json");
-    let fresh = std::fs::metadata(&cache)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.elapsed().ok())
-        .is_some_and(|age| (age.as_secs() as i64) < CLAUDE_TTL);
-    let (body, error) = if fresh {
-        (read_json(cache.clone()), None)
-    } else {
+    // One API budget shared with claude-usage.sh (the prompt and the Claude
+    // statusline): its cache, its last-attempt stamp and its 429 backoff, so
+    // the two never both ask within a minute or keep a rate limit going.
+    let dir = home().join(".cache/claude-usage");
+    let cache = dir.join("usage.json");
+    let stamp = dir.join("last-attempt");
+    let backoff = dir.join("backoff");
+    let (until, strikes) = read_backoff(&backoff);
+    let cache_age = age_secs(&cache);
+    let asked_recently = age_secs(&stamp).is_some_and(|age| age < CLAUDE_TTL);
+    let fresh = cache_age.is_some_and(|age| age < CLAUDE_TTL);
+    let mut note = None;
+    let mut error = None;
+    if !fresh && !asked_recently && now() >= until {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(&stamp, b"");
         match get(
             "https://api.anthropic.com/api/oauth/usage",
             &[
@@ -165,26 +194,49 @@ fn claude() -> Option<Provider> {
             ],
         ) {
             Ok(body) => {
-                if let Some(dir) = cache.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                let tmp = cache.with_extension("sidebar.tmp");
+                let tmp = dir.join("usage.json.sidebar.tmp");
                 if std::fs::write(&tmp, body.to_string()).is_ok() {
                     let _ = std::fs::rename(&tmp, &cache);
                 }
-                (Some(body), None)
+                let _ = std::fs::remove_file(&backoff);
             }
-            // Fall back to whatever the cache holds, flagged as stale.
-            Err(err) => (read_json(cache.clone()), Some(err)),
+            Err(err) if err.starts_with("rate limited") => {
+                let strikes = strikes + 1;
+                let _ = std::fs::write(
+                    &backoff,
+                    format!("{} {strikes}\n", now() + backoff_secs(strikes)),
+                );
+            }
+            Err(err) => error = Some(err),
         }
-    };
+    }
+    let body = read_json(cache.clone());
+    // Say how old the numbers are once they are not from this minute.
+    let (until, _) = read_backoff(&backoff);
+    if let Some(age) = age_secs(&cache).filter(|age| *age >= CLAUDE_TTL * 2) {
+        let mut text = format!("numbers from {} ago", short_age(age));
+        if until > now() {
+            text = format!("API busy · {text} · retry in {}", short_age(until - now()));
+        }
+        note = Some(text);
+    }
     let windows = body.as_ref().map(claude_windows).unwrap_or_default();
     Some(Provider {
         name: "Claude",
         plan,
         error: error.or_else(|| body.is_none().then(|| "no usage data yet".into())),
+        note,
         windows,
     })
+}
+
+/// `90` → `1m`, `7500` → `2h`, for "numbers from … ago".
+fn short_age(secs: i64) -> String {
+    match secs.max(0) {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s => format!("{}h", s / 3600),
+    }
 }
 
 fn claude_windows(body: &Value) -> Vec<Window> {
@@ -256,12 +308,14 @@ fn codex() -> Option<Provider> {
             plan: body["plan_type"].as_str().map(capitalize),
             windows: codex_windows(&body),
             error: None,
+            note: None,
         },
         Err(err) => Provider {
             name: "Codex",
             plan: None,
             windows: Vec::new(),
             error: Some(err),
+            note: None,
         },
     })
 }
@@ -322,12 +376,14 @@ fn opencode_go() -> Option<Provider> {
             plan: None,
             windows: opencode_windows(&body),
             error: None,
+            note: None,
         },
         Err(err) => Provider {
             name: "OpenCode Go",
             plan: None,
             windows: Vec::new(),
             error: Some(err),
+            note: None,
         },
     })
 }
@@ -379,6 +435,15 @@ fn opencode_windows(body: &Value) -> Vec<Window> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backoff_doubles_from_two_minutes_and_caps_at_fifteen() {
+        assert_eq!(backoff_secs(1), 120);
+        assert_eq!(backoff_secs(2), 240);
+        assert_eq!(backoff_secs(3), 480);
+        assert_eq!(backoff_secs(4), 900);
+        assert_eq!(backoff_secs(40), 900);
+    }
 
     #[test]
     fn iso_times_parse_to_unix_seconds() {

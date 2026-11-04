@@ -764,6 +764,7 @@ enum Setting {
     AutoOpen,
     StrictToggle,
     AutoClose,
+    SyncView,
     FocusOnOpen,
     FollowCwd,
     GitDecorations,
@@ -1314,6 +1315,7 @@ impl App {
         self.sidebar_state.dock_right = shared.dock_right;
         self.sidebar_state.strict_toggle = shared.strict_toggle;
         self.sidebar_state.auto_close = shared.auto_close;
+        self.sidebar_state.sync_view = shared.sync_view;
         self.sidebar_state.focus_on_open = shared.focus_on_open;
         if shared.scm_tree_view != self.tree_view {
             // Toggled from another pane (separated view, a preview tab).
@@ -2590,6 +2592,17 @@ impl App {
                 true,
             ),
             (
+                Setting::SyncView,
+                "Same view everywhere",
+                if self.sidebar_state.sync_view {
+                    "on"
+                } else {
+                    "off"
+                }
+                .to_string(),
+                true,
+            ),
+            (
                 Setting::FocusOnOpen,
                 "Focus on open",
                 if self.sidebar_state.focus_on_open {
@@ -2700,6 +2713,10 @@ impl App {
             Setting::AutoClose => {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.auto_close = !state.auto_close);
+            }
+            Setting::SyncView => {
+                self.sidebar_state =
+                    sidebar::update_state(|state| state.sync_view = !state.sync_view);
             }
             Setting::FocusOnOpen => {
                 self.sidebar_state =
@@ -3515,10 +3532,31 @@ impl App {
             return None;
         }
         self.sidebar_state = sidebar::update_state(|state| {
-            state.active = view;
-            state.search_active = false;
+            state.set_activity(match view {
+                View::Explorer => sidebar::Activity::Explorer,
+                View::SourceControl => sidebar::Activity::SourceControl,
+            })
         });
         Some(Exit::Switch)
+    }
+
+    /// ⚙ "Same view everywhere": follow a view picked in another sidebar
+    /// (this one only ever shows Source Control). Waits while a prompt, menu
+    /// or picker is open here.
+    pub fn sync_activity(&mut self) -> Option<Exit> {
+        if !self.merged() || self.overlay.is_some() {
+            return None;
+        }
+        let shared = sidebar::load_state();
+        if !shared.sync_view {
+            return None;
+        }
+        match shared.activity() {
+            sidebar::Activity::SourceControl => None,
+            sidebar::Activity::Explorer => Some(Exit::Switch),
+            sidebar::Activity::Search => Some(Exit::Search { focus_query: false }),
+            sidebar::Activity::Usage => Some(Exit::Usage),
+        }
     }
 
     /// The Usage view lives in the Explorer: hand the pane over to it open.
@@ -3526,10 +3564,8 @@ impl App {
         if !self.merged() {
             return None;
         }
-        self.sidebar_state = sidebar::update_state(|state| {
-            state.active = View::Explorer;
-            state.search_active = false;
-        });
+        self.sidebar_state =
+            sidebar::update_state(|state| state.set_activity(sidebar::Activity::Usage));
         Some(Exit::Usage)
     }
 
@@ -3537,10 +3573,8 @@ impl App {
         if !self.merged() {
             return None;
         }
-        self.sidebar_state = sidebar::update_state(|state| {
-            state.active = View::Explorer;
-            state.search_active = true;
-        });
+        self.sidebar_state =
+            sidebar::update_state(|state| state.set_activity(sidebar::Activity::Search));
         Some(Exit::Search { focus_query })
     }
 

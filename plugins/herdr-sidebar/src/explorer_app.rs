@@ -313,6 +313,7 @@ enum Setting {
     AutoOpen,
     StrictToggle,
     AutoClose,
+    SyncView,
     FocusOnOpen,
     FollowCwd,
     HiddenFiles,
@@ -359,6 +360,9 @@ pub struct App {
     notice: Option<String>,
     /// Active `/` find, highlighted until Esc.
     find: Option<FindState>,
+    /// The view this sidebar showed at the last check, to tell a switch the
+    /// user made here (published to every sidebar) from one to follow.
+    last_activity: sidebar::Activity,
     /// The Usage view's last answer and when it arrived, the fetch in flight,
     /// and the view's scroll offset.
     usage: Option<(Vec<herdr_sidebar::usage::Provider>, std::time::Instant)>,
@@ -545,6 +549,7 @@ impl App {
             suspended_search: None,
             notice: None,
             find: None,
+            last_activity: sidebar::Activity::Explorer,
             usage: None,
             usage_rx: None,
             usage_scroll: 0,
@@ -641,11 +646,59 @@ impl App {
     /// A separated Source Control pane can change this shared setting while
     /// the Explorer keeps running. Re-read just this field so the tree reacts
     /// without adopting unrelated process-local mode changes.
+    fn current_activity(&self) -> sidebar::Activity {
+        match self.overlay {
+            None => sidebar::Activity::Explorer,
+            Some(Overlay::ContentSearch { .. }) => sidebar::Activity::Search,
+            Some(Overlay::Usage) => sidebar::Activity::Usage,
+            // A modal (menu, prompt, settings…) sits over whatever view was
+            // showing; it is not a view switch of its own.
+            Some(_) => self.last_activity,
+        }
+    }
+
+    /// ⚙ "Same view everywhere": publish a view the user picked here, or
+    /// follow one picked in another sidebar. Waits while a prompt, menu or
+    /// confirmation is open here, so nothing is yanked mid-edit.
+    pub fn sync_activity(&mut self) -> Option<Exit> {
+        if !self.merged() {
+            return None;
+        }
+        let mine = self.current_activity();
+        if mine != self.last_activity {
+            self.last_activity = mine;
+            self.sidebar_state = sidebar::update_state(|state| state.set_activity(mine));
+            return None;
+        }
+        let shared = sidebar::load_state();
+        if !shared.sync_view || shared.activity() == mine {
+            return None;
+        }
+        if !matches!(
+            self.overlay,
+            None | Some(Overlay::ContentSearch { .. } | Overlay::Usage)
+        ) {
+            return None;
+        }
+        match shared.activity() {
+            sidebar::Activity::Explorer => self.overlay = None,
+            sidebar::Activity::Usage => self.open_usage(),
+            sidebar::Activity::Search => self.open_content_search(false),
+            sidebar::Activity::SourceControl => {
+                self.last_activity = sidebar::Activity::SourceControl;
+                return Some(Exit::Switch);
+            }
+        }
+        self.last_activity = self.current_activity();
+        None
+    }
+
     fn sync_shared_settings(&mut self) {
         let shared = sidebar::load_state();
         self.sidebar_state.dock_right = shared.dock_right;
         self.sidebar_state.strict_toggle = shared.strict_toggle;
         self.sidebar_state.auto_close = shared.auto_close;
+        self.sidebar_state.sync_view = shared.sync_view;
         self.sidebar_state.focus_on_open = shared.focus_on_open;
         self.sidebar_state.custom_editor_on_click = shared.custom_editor_on_click;
         let old_git_footer = self.sidebar_state.show_git_footer;
@@ -2831,6 +2884,17 @@ impl App {
                 true,
             ),
             (
+                Setting::SyncView,
+                "Same view everywhere",
+                if self.sidebar_state.sync_view {
+                    "on"
+                } else {
+                    "off"
+                }
+                .to_string(),
+                true,
+            ),
+            (
                 Setting::FocusOnOpen,
                 "Focus on open",
                 if self.sidebar_state.focus_on_open {
@@ -2949,6 +3013,10 @@ impl App {
             Setting::AutoClose => {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.auto_close = !state.auto_close);
+            }
+            Setting::SyncView => {
+                self.sidebar_state =
+                    sidebar::update_state(|state| state.sync_view = !state.sync_view);
             }
             Setting::FocusOnOpen => {
                 self.sidebar_state =

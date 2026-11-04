@@ -269,6 +269,41 @@ impl PreviewPlacement {
     }
 }
 
+/// Which of the four views a sidebar shows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Activity {
+    Explorer,
+    Usage,
+    SourceControl,
+    Search,
+}
+
+impl State {
+    /// The view last picked, as recorded here.
+    pub fn activity(&self) -> Activity {
+        if self.active == View::SourceControl {
+            Activity::SourceControl
+        } else if self.usage_active {
+            Activity::Usage
+        } else if self.search_active {
+            Activity::Search
+        } else {
+            Activity::Explorer
+        }
+    }
+
+    /// Record `activity` as the view last picked.
+    pub fn set_activity(&mut self, activity: Activity) {
+        self.active = if activity == Activity::SourceControl {
+            View::SourceControl
+        } else {
+            View::Explorer
+        };
+        self.usage_active = activity == Activity::Usage;
+        self.search_active = activity == Activity::Search;
+    }
+}
+
 /// The sticky sidebar setting, shared by both plugins.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct State {
@@ -277,6 +312,12 @@ pub struct State {
     /// Restore the Search activity rather than the Explorer tree when the
     /// unified sidebar is reopened. Search shares the Explorer process.
     pub search_active: bool,
+    /// Likewise for the Usage view (also in the Explorer process).
+    pub usage_active: bool,
+    /// Every sidebar follows the view the user last picked in any of them
+    /// (Explorer / Usage / Search / Source Control), across tabs, workspaces
+    /// and herdr sessions.
+    pub sync_view: bool,
     /// Show the hotkey chips at the bottom of the sidebar (they always
     /// live in the ⚙ Settings modal; the footer copy is opt-in).
     pub show_hotkeys: bool,
@@ -338,6 +379,8 @@ impl Default for State {
             merged: true,
             active: View::Explorer,
             search_active: false,
+            usage_active: false,
+            sync_view: true,
             show_hotkeys: false,
             show_git_footer: true,
             icons: None,
@@ -484,7 +527,10 @@ fn combine_state(local: &str, settings: Option<&str>) -> State {
     {
         let object = value.as_object_mut().expect("object");
         for (key, value) in settings {
-            if !matches!(key.as_str(), "active" | "search_active" | "font_prompt") {
+            if !matches!(
+                key.as_str(),
+                "active" | "search_active" | "usage_active" | "font_prompt"
+            ) {
                 object.insert(key, value);
             }
         }
@@ -559,10 +605,12 @@ fn write_state(path: &Path, state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"auto_close\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"usage_active\":{},\"sync_view\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"auto_close\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.search_active,
+        state.usage_active,
+        state.sync_view,
         state.show_hotkeys,
         state.show_git_footer,
         state.font_prompt_done,
@@ -586,7 +634,7 @@ fn write_state(path: &Path, state: State) {
         return;
     };
     let mut local = serde_json::Map::new();
-    for key in ["active", "search_active", "font_prompt"] {
+    for key in ["active", "search_active", "usage_active", "font_prompt"] {
         if let Some(value) = object.remove(key) {
             local.insert(key.to_owned(), value);
         }
@@ -1002,6 +1050,14 @@ pub fn parse_state(json: &str) -> State {
             .get("search_active")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.search_active),
+        usage_active: value
+            .get("usage_active")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.usage_active),
+        sync_view: value
+            .get("sync_view")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.sync_view),
         show_hotkeys: value
             .get("hotkeys")
             .and_then(|v| v.as_bool())
@@ -1195,11 +1251,33 @@ mod tests {
     }
 
     #[test]
+    fn the_last_picked_view_round_trips_and_the_flags_stay_exclusive() {
+        let mut state = State::default();
+        for activity in [
+            Activity::Usage,
+            Activity::Search,
+            Activity::SourceControl,
+            Activity::Explorer,
+            Activity::Usage,
+        ] {
+            state.set_activity(activity);
+            assert_eq!(state.activity(), activity);
+            assert!(!(state.usage_active && state.search_active));
+        }
+        // Source Control wins over a stale Usage flag from an older writer.
+        state.usage_active = true;
+        state.active = View::SourceControl;
+        assert_eq!(state.activity(), Activity::SourceControl);
+    }
+
+    #[test]
     fn state_roundtrip_and_forgiving_parse() {
         let state = State {
             merged: true,
             active: View::SourceControl,
             search_active: true,
+            usage_active: true,
+            sync_view: false,
             show_hotkeys: true,
             show_git_footer: false,
             icons: Some(crate::icons::IconTheme::Emoji),
@@ -1217,12 +1295,15 @@ mod tests {
             custom_editor_on_click: true,
             scm_tree_view: true,
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"auto_close\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"scm_tree_view\":true,\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"usage_active\":true,\"sync_view\":false,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"auto_close\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"scm_tree_view\":true,\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         // Files written before the flag existed keep auto-open AND the git
         // decorations on.
         assert!(parse_state("{\"merged\":true}").auto_open);
+        // Older files: Usage off, view sync on.
+        assert!(!parse_state("{\"merged\":true}").usage_active);
+        assert!(parse_state("{\"merged\":true}").sync_view);
         // Files written before the toggle settings existed keep the
         // historical toggle behavior: focus an open sidebar, focus on open.
         assert!(!parse_state("{\"merged\":true}").strict_toggle);

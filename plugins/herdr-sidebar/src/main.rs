@@ -314,7 +314,10 @@ fn main() -> std::io::Result<()> {
             .then_some(false)
     };
     let mut quick_open_on_open = initial_activity == Some(ensure::Target::QuickOpen);
-    let mut usage_on_open = false;
+    let mut usage_on_open = pinned.is_none()
+        && persisted.merged
+        && persisted.active == View::Explorer
+        && persisted.usage_active;
     let result = loop {
         let exit = match view {
             View::Explorer => run_explorer(
@@ -602,6 +605,9 @@ fn run_explorer(
         app.heartbeat();
         app.poll_picker();
         app.tick();
+        if let Some(exit) = app.sync_activity() {
+            return Ok(exit);
+        }
         roots.record(&app.root_path());
     }
 }
@@ -649,6 +655,9 @@ fn run_scm(
         if last_tick.elapsed() >= REFRESH_EVERY {
             app.tick();
             last_tick = std::time::Instant::now();
+        }
+        if let Some(exit) = app.sync_activity() {
+            return Ok(exit);
         }
         roots.record(app.root_path());
     }

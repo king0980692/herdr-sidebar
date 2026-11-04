@@ -5525,52 +5525,70 @@ fn usage_color(used: f64, limited: bool) -> Color {
     }
 }
 
-/// A `cells`-wide bar: the used part solid (eighth-blocks for the fraction),
-/// the rest light; `pace` marks where an even pace would be by now.
+/// A `cells`-wide bar drawn as a thin line (`━` used, `─` left), so it sits
+/// mid-cell with air above and below instead of a full block crowding the
+/// label over it. `pace` puts a `┃` where an even pace would be by now —
+/// over the used part too, so "used more than the time gone" is visible.
 fn usage_bar(used: f64, cells: usize, color: Color, pace: Option<f64>) -> Vec<Span<'static>> {
-    const EIGHTHS: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
     let exact = used.clamp(0.0, 100.0) / 100.0 * cells as f64;
     let full = (exact.floor() as usize).min(cells);
-    let part = ((exact - full as f64) * 8.0).floor() as usize;
-    let pace_cell = pace.map(|p| ((p.clamp(0.0, 100.0) / 100.0) * cells as f64) as usize);
-    let mut spans = vec![Span::styled("█".repeat(full), Style::default().fg(color))];
-    let mut used_cells = full;
-    if part > 0 && used_cells < cells {
-        spans.push(Span::styled(EIGHTHS[part], Style::default().fg(color)));
-        used_cells += 1;
-    }
-    for cell in used_cells..cells {
-        if Some(cell) == pace_cell {
-            spans.push(Span::styled(
-                "│",
-                Style::default().fg(palette().header_accent),
-            ));
-        } else {
-            spans.push(Span::styled("░", Style::default().dim()));
-        }
-    }
-    spans
+    // A half-cell cap for the fraction keeps small steps visible.
+    let half = exact - full as f64 >= 0.5 && full < cells;
+    let pace_cell =
+        pace.map(|p| (((p.clamp(0.0, 100.0) / 100.0) * cells as f64) as usize).min(cells - 1));
+    (0..cells)
+        .map(|cell| {
+            if Some(cell) == pace_cell {
+                Span::styled("┃", Style::default().fg(palette().header_accent).bold())
+            } else if cell < full {
+                Span::styled("━", Style::default().fg(color))
+            } else if cell == full && half {
+                Span::styled("╸", Style::default().fg(color))
+            } else {
+                Span::styled("─", Style::default().dim())
+            }
+        })
+        .collect()
 }
 
-/// One provider's card: name and plan, then per window its label and
-/// percentage, a full-width bar, and when it resets (and the even pace).
+/// One provider's card: a header band (name, plan badge, highest usage),
+/// then per window its label and percentage, a thin bar with the pace
+/// marker, and when it resets and how it compares with an even pace.
 fn usage_card(
     provider: &herdr_sidebar::usage::Provider,
     width: usize,
     now: i64,
 ) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from(vec![
-        Span::raw(" "),
-        Span::styled(provider.name, Style::default().bold()),
-        Span::styled(
-            provider
-                .plan
-                .as_deref()
-                .map(|p| format!("  {p}"))
-                .unwrap_or_default(),
-            Style::default().dim(),
-        ),
-    ])];
+    let band = Style::default().bg(palette().selection_bg);
+    let worst = provider
+        .windows
+        .iter()
+        .max_by(|a, b| a.used.total_cmp(&b.used));
+    let mut head = vec![Span::styled(format!(" {} ", provider.name), band.bold())];
+    if let Some(plan) = &provider.plan {
+        head.push(Span::styled(
+            format!(" {plan} "),
+            Style::default()
+                .bg(palette().muted_button_bg)
+                .fg(palette().muted_button_fg),
+        ));
+    }
+    let worst_text = worst
+        .map(|w| format!("{:.0}% ", w.used))
+        .unwrap_or_default();
+    let used_cells: usize = head.iter().map(Span::width).sum::<usize>() + worst_text.len();
+    head.push(Span::styled(
+        " ".repeat(width.saturating_sub(used_cells)),
+        band,
+    ));
+    head.push(Span::styled(
+        worst_text,
+        band.fg(worst
+            .map(|w| usage_color(w.used, w.limited))
+            .unwrap_or(Color::Reset))
+            .bold(),
+    ));
+    let mut lines = vec![Line::from(head)];
     if let Some(err) = &provider.error {
         lines.push(Line::styled(
             format!("  ! {err}"),
@@ -5580,18 +5598,35 @@ fn usage_card(
     if let Some(note) = &provider.note {
         lines.push(Line::styled(format!("  {note}"), Style::default().dim()));
     }
-    let bar_cells = width.saturating_sub(3).max(4);
+    let bar_cells = width.saturating_sub(4).max(4);
     for w in &provider.windows {
+        lines.push(Line::raw(""));
         let color = usage_color(w.used, w.limited);
         let pct = format!("{:.0}%", w.used);
-        let label = truncate_to(w.label.clone(), width.saturating_sub(pct.len() + 4));
-        let pad = width.saturating_sub(2 + Span::raw(label.as_str()).width() + pct.len() + 1);
-        lines.push(Line::from(vec![
+        let badge = if w.limited { " LIMIT " } else { "" };
+        let label = truncate_to(
+            w.label.clone(),
+            width.saturating_sub(pct.len() + badge.len() + 5),
+        );
+        let pad = width
+            .saturating_sub(2 + Span::raw(label.as_str()).width() + badge.len() + pct.len() + 2);
+        let mut row = vec![
             Span::raw("  "),
-            Span::raw(label),
+            Span::styled(label, Style::default().bold()),
             Span::raw(" ".repeat(pad)),
-            Span::styled(pct, Style::default().fg(color).bold()),
-        ]));
+        ];
+        if w.limited {
+            row.push(Span::styled(
+                badge,
+                Style::default()
+                    .bg(palette().deleted)
+                    .fg(Color::Black)
+                    .bold(),
+            ));
+            row.push(Span::raw(" "));
+        }
+        row.push(Span::styled(pct, Style::default().fg(color).bold()));
+        lines.push(Line::from(row));
         // Where an even pace would be by now, when the window's length is known.
         let pace = match (w.resets_at, w.length_secs) {
             (Some(reset), Some(len)) if len > 0 => {
@@ -5602,7 +5637,7 @@ fn usage_card(
         let mut bar = vec![Span::raw("  ")];
         bar.extend(usage_bar(w.used, bar_cells, color, pace));
         lines.push(Line::from(bar));
-        let mut detail = Vec::new();
+        let mut detail = vec![Span::raw("  ")];
         if w.limited {
             detail.push(Span::styled(
                 "limit reached · ",
@@ -5611,25 +5646,21 @@ fn usage_card(
         }
         if let Some(reset) = w.resets_at {
             detail.push(Span::styled(
-                format!("↻ {}", short_duration(reset - now)),
+                format!("resets in {}", short_duration(reset - now)),
                 Style::default().dim(),
             ));
         }
+        // Against the pace marker, in words: only worth saying when ahead.
         if let Some(p) = pace
             && !w.limited
+            && w.used > p + 5.0
         {
-            let ahead = w.used > p + 5.0;
             detail.push(Span::styled(
-                format!(" · pace {p:.0}%"),
-                if ahead {
-                    Style::default().fg(Color::Indexed(208))
-                } else {
-                    Style::default().dim()
-                },
+                format!(" · {:.0}% ahead", w.used - p),
+                Style::default().fg(Color::Indexed(208)),
             ));
         }
-        if !detail.is_empty() {
-            detail.insert(0, Span::raw("  "));
+        if detail.len() > 1 {
             lines.push(Line::from(detail));
         }
     }
@@ -6002,6 +6033,29 @@ mod tests {
             "…sidebar/src"
         );
         assert_eq!(truncate_left("報告/資料夾", 6), "…料夾");
+    }
+
+    #[test]
+    fn a_usage_bar_is_a_thin_line_with_the_pace_marker_even_over_the_fill() {
+        let text = |used, pace| {
+            usage_bar(used, 10, Color::Green, pace)
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        assert_eq!(text(50.0, None), "━━━━━─────");
+        assert_eq!(text(55.0, None), "━━━━━╸────", "a half cell shows");
+        assert_eq!(
+            text(50.0, Some(20.0)),
+            "━━┃━━─────",
+            "marker over the used part"
+        );
+        assert_eq!(text(10.0, Some(80.0)), "━───────┃─");
+        assert_eq!(
+            text(100.0, Some(100.0)),
+            "━━━━━━━━━┃",
+            "clamped to the last cell"
+        );
     }
 
     #[test]

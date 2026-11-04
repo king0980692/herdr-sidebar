@@ -763,6 +763,7 @@ enum Setting {
     PreviewPlacement,
     AutoOpen,
     StrictToggle,
+    AutoClose,
     FocusOnOpen,
     FollowCwd,
     GitDecorations,
@@ -1311,6 +1312,7 @@ impl App {
         self.sidebar_state.show_git_footer = shared.show_git_footer;
         self.sidebar_state.dock_right = shared.dock_right;
         self.sidebar_state.strict_toggle = shared.strict_toggle;
+        self.sidebar_state.auto_close = shared.auto_close;
         self.sidebar_state.focus_on_open = shared.focus_on_open;
         if shared.scm_tree_view != self.tree_view {
             // Toggled from another pane (separated view, a preview tab).
@@ -2571,6 +2573,17 @@ impl App {
                 true,
             ),
             (
+                Setting::AutoClose,
+                "Close when alone",
+                if self.sidebar_state.auto_close {
+                    "on"
+                } else {
+                    "off"
+                }
+                .to_string(),
+                true,
+            ),
+            (
                 Setting::FocusOnOpen,
                 "Focus on open",
                 if self.sidebar_state.focus_on_open {
@@ -2677,6 +2690,10 @@ impl App {
             Setting::StrictToggle => {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.strict_toggle = !state.strict_toggle);
+            }
+            Setting::AutoClose => {
+                self.sidebar_state =
+                    sidebar::update_state(|state| state.auto_close = !state.auto_close);
             }
             Setting::FocusOnOpen => {
                 self.sidebar_state =

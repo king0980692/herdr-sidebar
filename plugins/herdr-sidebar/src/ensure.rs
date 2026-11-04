@@ -159,7 +159,7 @@ struct RefreshTab {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct RefreshPlan {
     tabs: Vec<RefreshTab>,
-    sidebar_only: Vec<(String, usize)>,
+    sidebar_only: Vec<RefreshTab>,
 }
 
 /// What a refresh did. `kept` sidebars did not close (a draft could not be
@@ -215,7 +215,7 @@ fn refresh_plan(panes_json: &str) -> Result<RefreshPlan, String> {
         if has_other {
             plan.tabs.push(RefreshTab { tab, sidebars });
         } else {
-            plan.sidebar_only.push((tab, sidebars.len()));
+            plan.sidebar_only.push(RefreshTab { tab, sidebars });
         }
     }
     Ok(plan)
@@ -238,10 +238,11 @@ const REFRESH_CLOSE_WAIT_STEPS: usize = 50;
 fn refresh_with(host: &mut impl RefreshHost) -> Result<RefreshReport, String> {
     let plan = refresh_plan(&host.list()?)?;
     let mut report = RefreshReport::default();
-    for (tab, count) in &plan.sidebar_only {
-        report.kept += count;
+    for only in &plan.sidebar_only {
+        report.kept += only.sidebars.len();
         report.errors.push(format!(
-            "{tab}: the sidebar is the tab's only pane; add another pane and retry"
+            "{}: the sidebar is the tab's only pane; add another pane and retry",
+            only.tab
         ));
     }
     // Ask every sidebar first, so they all save and close in parallel.
@@ -357,6 +358,47 @@ fn ipc_ok(response: &str) -> Result<(), String> {
     }
 }
 
+/// ⚙ "Close when alone": ask every sidebar that is now the last pane left in
+/// its tab to save its drafts and close itself (Ctrl+Q, never a hard close),
+/// which closes the emptied tab with it. Returns the panes asked.
+fn autoclose_with(host: &mut impl RefreshHost, gone: Option<&str>) -> Result<Vec<String>, String> {
+    let mut panes: serde_json::Value = serde_json::from_str(launch::strip_bom(&host.list()?))
+        .map_err(|error| error.to_string())?;
+    // On `pane.exited` the pane that just exited can still be listed.
+    if let (Some(gone), Some(list)) = (gone, panes["result"]["panes"].as_array_mut()) {
+        list.retain(|pane| pane["pane_id"] != gone);
+    }
+    let plan = refresh_plan(&panes.to_string())?;
+    let mut asked = Vec::new();
+    for only in plan.sidebar_only {
+        for (id, _) in only.sidebars {
+            if host.request_close(&id).is_ok() {
+                asked.push(id);
+            }
+        }
+    }
+    Ok(asked)
+}
+
+/// `--autoclose`, run on every `pane.closed` and `pane.exited` (a shell that
+/// exits on its own removes its pane WITHOUT a `pane.closed`):
+/// [`autoclose_with`] when the setting is on, a no-op otherwise.
+pub fn autoclose() -> std::io::Result<()> {
+    if !crate::state::load_state().auto_close {
+        return Ok(());
+    }
+    let event: serde_json::Value = std::env::var("HERDR_PLUGIN_EVENT_JSON")
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
+    let gone = event["data"]["pane_id"]
+        .as_str()
+        .or(event["pane_id"].as_str());
+    autoclose_with(&mut LiveRefresh, gone)
+        .map(drop)
+        .map_err(std::io::Error::other)
+}
+
 struct LiveRefresh;
 
 impl RefreshHost for LiveRefresh {
@@ -395,6 +437,17 @@ pub fn refresh_all() -> std::io::Result<RefreshReport> {
 /// focus, and respecting a tab the user toggled closed. Toggle mode (the
 /// action): open-or-focus-or-close, like VS Code's explorer shortcut.
 pub fn run(mode: Mode) -> std::io::Result<()> {
+    // Focus hooks land here first: tell the sidebar in the focused tab, so it
+    // starts following its neighbour's `cd` right away (see focus_marker).
+    if let Ok(tab) = std::env::var("HERDR_TAB_ID")
+        && !tab.is_empty()
+    {
+        let marker = launch::focus_marker(&tab);
+        if let Some(dir) = marker.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&marker, b"");
+    }
     let toggle = matches!(mode, Mode::Toggle(_));
     let activation = match mode {
         Mode::Activate(target) => Some(target),
@@ -1060,6 +1113,32 @@ mod tests {
         assert_eq!(host.asked, vec!["young"]);
         assert!(host.has("young"), "never hard-closed");
         assert_eq!(report.kept, 1);
+    }
+
+    #[test]
+    fn autoclose_asks_only_sidebars_left_alone_in_their_tab() {
+        let mut host = FakeRefresh::default();
+        host.pane("alone", "w1:t1", sidebar());
+        host.pane("docked", "w1:t2", sidebar());
+        host.pane("work", "w1:t2", serde_json::json!({}));
+        assert_eq!(autoclose_with(&mut host, None).unwrap(), vec!["alone"]);
+        assert_eq!(host.asked, vec!["alone"]);
+        assert!(
+            host.has("alone"),
+            "asked to close itself, never hard-closed"
+        );
+    }
+
+    #[test]
+    fn an_exited_pane_still_listed_counts_as_gone() {
+        let mut host = FakeRefresh::default();
+        host.pane("side", "w1:t1", sidebar());
+        host.pane("shell", "w1:t1", serde_json::json!({}));
+        assert!(autoclose_with(&mut host, None).unwrap().is_empty());
+        assert_eq!(
+            autoclose_with(&mut host, Some("shell")).unwrap(),
+            vec!["side"]
+        );
     }
 
     #[test]

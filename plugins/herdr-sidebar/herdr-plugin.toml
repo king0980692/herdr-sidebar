@@ -238,6 +238,21 @@ on = "tab.focused"
 platforms = ["linux", "macos"]
 command = ["./target/release/herdr-sidebar", "--ensure"]
 
+# ⚙ "Close when alone": when a pane closes, a sidebar left as the only pane in
+# its tab saves its drafts and closes itself, taking the tab with it. A no-op
+# while the setting is off. (Unix only: the Windows sidecar has no such mode.)
+[[events]]
+on = "pane.closed"
+platforms = ["linux", "macos"]
+command = ["./target/release/herdr-sidebar", "--autoclose"]
+
+# A shell that exits on its own (`exit`, an editor tab finishing) removes its
+# pane with pane.exited only, never pane.closed, so listen for that too.
+[[events]]
+on = "pane.exited"
+platforms = ["linux", "macos"]
+command = ["./target/release/herdr-sidebar", "--autoclose"]
+
 [[events]]
 on = "tab.focused"
 platforms = ["windows"]

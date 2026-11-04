@@ -300,6 +300,9 @@ pub struct State {
     /// instead of FOCUS: one press opens, the next press closes, wherever
     /// focus is. Off keeps the historical open / focus / close cycle.
     pub strict_toggle: bool,
+    /// Close a sidebar once it is the last pane left in its tab (which closes
+    /// the tab too), instead of leaving a sidebar-only husk behind.
+    pub auto_close: bool,
     /// Focus the sidebar once the toggle opens it. Off docks it in the
     /// background: focus stays in the pane the toggle was invoked from.
     pub focus_on_open: bool,
@@ -340,6 +343,7 @@ impl Default for State {
             font_prompt_done: false,
             auto_open: true,
             strict_toggle: false,
+            auto_close: false,
             focus_on_open: true,
             follow_cwd: true,
             git_deco: true,
@@ -513,7 +517,7 @@ fn write_state(path: &Path, state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"auto_close\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.search_active,
@@ -522,6 +526,7 @@ fn write_state(path: &Path, state: State) {
         state.font_prompt_done,
         state.auto_open,
         state.strict_toggle,
+        state.auto_close,
         state.focus_on_open,
         state.follow_cwd,
         state.git_deco,
@@ -944,6 +949,10 @@ pub fn parse_state(json: &str) -> State {
             .get("strict_toggle")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.strict_toggle),
+        auto_close: value
+            .get("auto_close")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.auto_close),
         focus_on_open: value
             .get("focus_on_open")
             .and_then(|v| v.as_bool())
@@ -1116,6 +1125,7 @@ mod tests {
             font_prompt_done: true,
             auto_open: false,
             strict_toggle: true,
+            auto_close: true,
             focus_on_open: false,
             follow_cwd: false,
             git_deco: false,
@@ -1125,7 +1135,7 @@ mod tests {
             custom_editor_on_click: true,
             scm_tree_view: true,
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"scm_tree_view\":true,\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"auto_close\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"scm_tree_view\":true,\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         // Files written before the flag existed keep auto-open AND the git
@@ -1134,6 +1144,7 @@ mod tests {
         // Files written before the toggle settings existed keep the
         // historical toggle behavior: focus an open sidebar, focus on open.
         assert!(!parse_state("{\"merged\":true}").strict_toggle);
+        assert!(!parse_state("{\"merged\":true}").auto_close);
         assert!(parse_state("{\"merged\":true}").focus_on_open);
         assert_eq!(
             parse_state("{\"merged\":true}").color_theme,

@@ -169,7 +169,22 @@ enum PromptKind {
     /// current root, or ~-prefixed).
     ChangeFolder,
     CustomEditor,
+    /// `/`: find files / folders by name across the whole project.
+    Find,
+    /// `a`: a file, or a folder when the name ends in `/`.
+    NewEntry(PathBuf),
 }
+
+/// The last `/` find: its matches stay highlighted in the tree (and `n` / `N`
+/// step through them) until Esc clears it.
+struct FindState {
+    query: String,
+    matches: std::collections::HashSet<PathBuf>,
+}
+
+/// Cap on `/` results: each match's folders get expanded so it shows in the
+/// tree, and thousands of expansions would bury the tree.
+const FIND_LIMIT: usize = 200;
 
 /// A modal layered over the tree: the context menu, a name prompt, or a
 /// delete confirmation. While one is open it owns keyboard and mouse input.
@@ -294,6 +309,7 @@ enum Setting {
     CustomEditorClick,
     AutoOpen,
     StrictToggle,
+    AutoClose,
     FocusOnOpen,
     FollowCwd,
     HiddenFiles,
@@ -338,6 +354,28 @@ pub struct App {
     suspended_search: Option<Overlay>,
     /// Transient status/error line shown in the footer until the next action.
     notice: Option<String>,
+    /// Active `/` find, highlighted until Esc.
+    find: Option<FindState>,
+    /// The header's path: `<repo>/<path inside it>` in a git project, else
+    /// the `~`-abbreviated path. Set per root, so a followed `cd` (which
+    /// re-roots through `App::new`) updates it.
+    header_path: String,
+    /// Running "Open in Browser" servers by the folder they serve, as their
+    /// `http://host:port/<token>` base, so further documents there reuse one.
+    site_servers: HashMap<PathBuf, String>,
+    /// The selected / hovered row and when it became so: a name too long for
+    /// its row scrolls (marquee) from that moment. `marquee_live` is set while
+    /// one is scrolling, so the event loop redraws often enough to animate.
+    marquee_selected: Option<(PathBuf, std::time::Instant)>,
+    marquee_hovered: Option<(PathBuf, std::time::Instant)>,
+    marquee_live: bool,
+    /// mtime of the upload server's stamp when last seen; a newer one means
+    /// a file just arrived, so the tree is re-read.
+    upload_seen: Option<std::time::SystemTime>,
+    /// First key of a vim pair (`dd`, `yy`) waiting for its second.
+    pending_key: Option<char>,
+    /// `yy`'s register: what `p` pastes a copy of.
+    yanked: Option<PathBuf>,
     // Merged-sidebar state.
     sidebar_state: sidebar::State,
     other_exe: Option<std::path::PathBuf>,
@@ -361,6 +399,14 @@ pub struct App {
     last_preview: Option<(String, herdr_sidebar::viewer::PreviewTarget)>,
     /// Last heartbeat stamp, throttling the token refresh.
     last_beat: std::time::Instant,
+    /// When the sibling cwd was last sampled, and whether focus was in this
+    /// tab then (sample fast while it is, at the heartbeat pace otherwise).
+    last_follow: std::time::Instant,
+    follow_fast: bool,
+    /// This pane's tab (learned from the first sample) and the mtime its
+    /// focus marker had when last checked.
+    my_tab: Option<String>,
+    focus_seen: Option<std::time::SystemTime>,
     /// A native folder picker running on a background thread; its result
     /// arrives here (None = cancelled).
     picking: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
@@ -443,6 +489,7 @@ impl App {
         root: PathBuf,
         cwd_follower: std::rc::Rc<std::cell::RefCell<herdr_sidebar::launch::CwdFollower>>,
     ) -> Self {
+        let header = header_path(&root);
         let mut tree = Tree::new(root);
         // Mirror the tree the user was already looking at. Idle ticks keep
         // same-root sidebars synchronized after startup too.
@@ -487,6 +534,17 @@ impl App {
             overlay: None,
             suspended_search: None,
             notice: None,
+            find: None,
+            header_path: header,
+            site_servers: HashMap::new(),
+            marquee_selected: None,
+            marquee_hovered: None,
+            marquee_live: false,
+            upload_seen: std::fs::metadata(herdr_sidebar::upload::stamp_path())
+                .and_then(|m| m.modified())
+                .ok(),
+            pending_key: None,
+            yanked: None,
             sidebar_state,
             other_exe,
             activity: ActivityZones::default(),
@@ -497,6 +555,10 @@ impl App {
             last_click: None,
             last_preview: None,
             last_beat: std::time::Instant::now(),
+            last_follow: std::time::Instant::now(),
+            follow_fast: true,
+            my_tab: None,
+            focus_seen: None,
             picking: None,
             cwd_follower,
             repos,
@@ -535,6 +597,7 @@ impl App {
         self.sync_shared_settings();
         self.sync_shared_tree();
         self.collect_quick_index();
+        self.collect_uploads();
         self.collect_content_search();
         self.collect_git_sync();
         self.start_content_search_if_due();
@@ -543,6 +606,18 @@ impl App {
             return;
         }
         self.request_decorations(false);
+    }
+
+    /// Focus is in this tab: wake the event loop more often, so a `cd` next
+    /// to the sidebar shows up within a fraction of a second.
+    pub fn follows_fast(&self) -> bool {
+        self.follow_fast && self.sidebar_state.follow_cwd
+    }
+
+    /// A too-long selected / hovered name is scrolling: redraw at animation
+    /// pace until it stops.
+    pub fn marquee_live(&self) -> bool {
+        self.marquee_live
     }
 
     pub fn is_syncing(&self) -> bool {
@@ -556,6 +631,7 @@ impl App {
         let shared = sidebar::load_state();
         self.sidebar_state.dock_right = shared.dock_right;
         self.sidebar_state.strict_toggle = shared.strict_toggle;
+        self.sidebar_state.auto_close = shared.auto_close;
         self.sidebar_state.focus_on_open = shared.focus_on_open;
         self.sidebar_state.custom_editor_on_click = shared.custom_editor_on_click;
         let old_git_footer = self.sidebar_state.show_git_footer;
@@ -745,6 +821,33 @@ impl App {
     /// seconds.
     pub fn heartbeat(&mut self) {
         self.poll_unified_close();
+        // Following a neighbour's `cd`: every 200ms while focus is in this
+        // tab (you are typing next to it), else at the 5s heartbeat pace —
+        // ~20 background sidebars need not each poll pane.list five times a second.
+        // Focus just entered this tab (the focus hook touched our marker):
+        // sample now and keep sampling fast.
+        if let Some(tab) = &self.my_tab {
+            let touched = std::fs::metadata(herdr_sidebar::launch::focus_marker(tab))
+                .and_then(|m| m.modified())
+                .ok();
+            if touched.is_some() && touched != self.focus_seen {
+                let first = self.focus_seen.is_none();
+                self.focus_seen = touched;
+                if !first {
+                    self.follow_fast = true;
+                    self.last_follow -= std::time::Duration::from_secs(5);
+                }
+            }
+        }
+        let follow_every = if self.follow_fast {
+            std::time::Duration::from_millis(200)
+        } else {
+            std::time::Duration::from_secs(5)
+        };
+        if self.last_follow.elapsed() >= follow_every {
+            self.last_follow = std::time::Instant::now();
+            self.follow_sibling_cwd();
+        }
         if self.last_beat.elapsed() < std::time::Duration::from_secs(5) {
             return;
         }
@@ -752,7 +855,6 @@ impl App {
         if let Some(ctl) = &self.pane_ctl {
             ctl.report_tokens(MY_VIEW, self.merged());
         }
-        self.follow_sibling_cwd();
     }
 
     fn poll_unified_close(&mut self) -> bool {
@@ -793,6 +895,10 @@ impl App {
         let Ok(panes) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})) else {
             return;
         };
+        self.follow_fast = herdr_sidebar::launch::tab_has_focus(&panes, &ctl.pane_id);
+        if self.my_tab.is_none() {
+            self.my_tab = herdr_sidebar::launch::tab_of_pane(&panes, &ctl.pane_id);
+        }
         let target = self
             .cwd_follower
             .borrow_mut()
@@ -834,8 +940,52 @@ impl App {
     /// Open a file in the preview pane BESIDE the sidebar (the tree stays
     /// visible): the shared viewer client reuses the tab's viewer pane or
     /// spawns one next to us.
+    /// Opening a file. Over ssh / ET a document (page, PDF, image, media)
+    /// goes to the connecting machine's browser instead — its preview link
+    /// is copied — since a browser shows those far better than the terminal.
     fn open_preview(&mut self, path: &Path) {
+        if herdr_sidebar::site::is_browser_document(path)
+            && let Some(ip) = actions::ssh_origin().and_then(|c| actions::ssh_server_ip(&c))
+        {
+            self.copy_browser_link(path, &ip);
+            return;
+        }
         self.open_preview_at(path, None);
+    }
+
+    /// Put `path`'s preview link on the connecting machine's clipboard,
+    /// reusing a still-running server for its folder rather than starting one
+    /// per click.
+    fn copy_browser_link(&mut self, path: &Path, ip: &str) {
+        let folder = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        // A server this sidebar started, else one any sidebar started for the
+        // folder before (its port and token are saved, so the link is stable).
+        let reused = self
+            .site_servers
+            .get(&folder)
+            .cloned()
+            .or_else(|| herdr_sidebar::site::saved_base(&folder, ip))
+            .and_then(|base| herdr_sidebar::site::reuse_link(&base, path));
+        let url = match reused {
+            Some(url) => url,
+            None => match herdr_sidebar::site::start(path, ip) {
+                Ok(url) => {
+                    if let Some((base, _)) = url.rsplit_once('/') {
+                        self.site_servers.insert(folder, base.to_string());
+                    }
+                    url
+                }
+                Err(err) => {
+                    self.notice = Some(format!("preview server failed: {err}"));
+                    return;
+                }
+            },
+        };
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        self.notice = Some(match actions::write_osc52_stdout(&url) {
+            Ok(_) => format!("link to {name} copied: paste it into your browser"),
+            Err(err) => format!("copy failed: {err} — link: {url}"),
+        });
     }
 
     fn open_preview_at(&mut self, path: &Path, line: Option<usize>) {
@@ -1123,10 +1273,62 @@ impl App {
             self.overlay_key(key);
             return None;
         }
+        // A half-typed `dd` / `yy` is forgotten on any other key.
+        if !matches!(key.code, KeyCode::Char('d' | 'y')) || !key.modifiers.is_empty() {
+            self.pending_key = None;
+        }
         match key.code {
             KeyCode::Char('q') => return Some(Exit::Quit),
-            // Esc never quits the sidebar — it closes the preview instead.
+            // Esc never quits the sidebar: it clears a `/` find highlight
+            // first, and otherwise closes the preview.
+            KeyCode::Esc if self.find.is_some() => self.find = None,
             KeyCode::Esc => self.close_preview(),
+            KeyCode::Char('/') => {
+                self.overlay = Some(Overlay::Prompt {
+                    title: "find".into(),
+                    input: self
+                        .find
+                        .as_ref()
+                        .map(|f| f.query.clone())
+                        .unwrap_or_default(),
+                    kind: PromptKind::Find,
+                });
+            }
+            KeyCode::Char('e') => self.edit_selection(),
+            KeyCode::Char('a') => {
+                let dir = self.target_dir();
+                self.overlay = Some(Overlay::Prompt {
+                    title: "new (end with / for a folder)".into(),
+                    input: String::new(),
+                    kind: PromptKind::NewEntry(dir),
+                });
+            }
+            // Ctrl-d / Ctrl-u: half a page, like vim.
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_by((self.page / 2).max(1) as isize);
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.move_by(-((self.page / 2).max(1) as isize));
+            }
+            KeyCode::Char('R') => self.act_on_selection(MenuAction::Rename),
+            KeyCode::Char('p') => self.paste_yanked(),
+            KeyCode::Char(c @ ('d' | 'y')) => {
+                if self.pending_key.take() == Some(c) {
+                    if c == 'd' {
+                        self.act_on_selection(MenuAction::Delete);
+                    } else if let Some(row) = self.selected_row() {
+                        let name = row.name.clone();
+                        self.yanked = Some(row.path.clone());
+                        self.notice = Some(format!("yanked {name} · p pastes a copy"));
+                    }
+                } else {
+                    self.pending_key = Some(c);
+                }
+                return None;
+            }
+
+            KeyCode::Char('n') if self.find.is_some() => self.jump_to_match(true),
+            KeyCode::Char('N') if self.find.is_some() => self.jump_to_match(false),
             KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
             KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
             KeyCode::PageUp => self.move_by(-(self.page as isize)),
@@ -1367,7 +1569,11 @@ impl App {
         let in_repo = target
             .as_ref()
             .is_some_and(|(path, _)| Git::owner_of(path).is_ok());
-        let entries = actions::menu_entries(target.as_ref().map(|(_, is_dir)| *is_dir), in_repo);
+        let entries = actions::menu_entries(
+            target.as_ref().map(|(_, is_dir)| *is_dir),
+            in_repo,
+            actions::ssh_origin().is_some(),
+        );
         let selected = entries
             .iter()
             .position(|e| matches!(e, MenuEntry::Action(..)))
@@ -2386,6 +2592,26 @@ impl App {
         }
     }
 
+    /// `e`: open the selected FILE in the editor — the ⚙ custom editor
+    /// command, else $HERDR_SIDEBAR_EDITOR / $VISUAL / $EDITOR — in its own
+    /// tab, the same path "Use editor on click" takes.
+    fn edit_selection(&mut self) {
+        let Some(row) = self.selected_row() else {
+            self.notice = Some("select a file to edit".into());
+            return;
+        };
+        if row.is_dir {
+            self.notice = Some("e opens files; this is a folder".into());
+            return;
+        }
+        if actions::configured_editor().is_none() {
+            self.notice = Some("no editor: set EDITOR, or a custom editor in ⚙ settings".into());
+            return;
+        }
+        let path = row.path.clone();
+        self.open_custom_editor(&path);
+    }
+
     fn open_custom_editor(&mut self, path: &Path) {
         let Some(pane_id) = self
             .pane_ctl
@@ -2527,6 +2753,17 @@ impl App {
                 true,
             ),
             (
+                Setting::AutoClose,
+                "Close when alone",
+                if self.sidebar_state.auto_close {
+                    "on"
+                } else {
+                    "off"
+                }
+                .to_string(),
+                true,
+            ),
+            (
                 Setting::FocusOnOpen,
                 "Focus on open",
                 if self.sidebar_state.focus_on_open {
@@ -2641,6 +2878,10 @@ impl App {
             Setting::StrictToggle => {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.strict_toggle = !state.strict_toggle);
+            }
+            Setting::AutoClose => {
+                self.sidebar_state =
+                    sidebar::update_state(|state| state.auto_close = !state.auto_close);
             }
             Setting::FocusOnOpen => {
                 self.sidebar_state =
@@ -2763,6 +3004,21 @@ impl App {
         let MenuEntry::Action(action, _) = entries[selected] else {
             return;
         };
+        self.perform_menu_action(action, target);
+    }
+
+    /// A context-menu action on the selected row, straight from a key (`dd`,
+    /// `R`) — the same path the menu takes.
+    fn act_on_selection(&mut self, action: MenuAction) {
+        let Some(row) = self.selected_row() else {
+            self.notice = Some("select something first".into());
+            return;
+        };
+        let target = Some((row.path.clone(), row.is_dir));
+        self.perform_menu_action(action, target);
+    }
+
+    fn perform_menu_action(&mut self, action: MenuAction, target: Option<(PathBuf, bool)>) {
         // Creation targets: the folder itself, a file's parent, or the root.
         let create_dir = match &target {
             Some((path, true)) => path.clone(),
@@ -2803,6 +3059,66 @@ impl App {
                         format!("sent to terminal clipboard: {text}")
                     }
                     Err(err) => format!("copy failed: {err}"),
+                });
+            }
+            MenuAction::OpenInBrowser => {
+                let Some((path, false)) = &target else { return };
+                let Some(ip) = actions::ssh_origin().and_then(|c| actions::ssh_server_ip(&c))
+                else {
+                    self.notice = Some("not in an ssh / ET session: no browser to open in".into());
+                    return;
+                };
+                self.copy_browser_link(path, &ip);
+            }
+            MenuAction::UploadHere => {
+                let Some(ip) = actions::ssh_origin().and_then(|c| actions::ssh_server_ip(&c))
+                else {
+                    self.notice = Some("not in an ssh / ET session: nowhere to upload from".into());
+                    return;
+                };
+                // Into the folder itself, a file's folder, or the root.
+                self.notice = Some(match herdr_sidebar::upload::start(&create_dir, &ip) {
+                    Err(err) => format!("upload server failed: {err}"),
+                    Ok(url) => match actions::write_osc52_stdout(&url) {
+                        Ok(_) => "upload link copied: paste it into your browser (stops after 10 min idle or Done)".into(),
+                        Err(err) => format!("copy failed: {err} — link: {url}"),
+                    },
+                });
+            }
+            MenuAction::DownloadViaBrowser => {
+                let Some((path, _)) = &target else { return };
+                let Some(ip) = actions::ssh_origin().and_then(|c| actions::ssh_server_ip(&c))
+                else {
+                    self.notice = Some("not in an ssh / ET session: nowhere to download to".into());
+                    return;
+                };
+                // The link goes to the CONNECTING machine's clipboard, so
+                // straight to OSC 52 (see DownloadToLocal).
+                self.notice = Some(match herdr_sidebar::serve::start(path, &ip) {
+                    Err(err) => format!("download server failed: {err}"),
+                    Ok(url) => match actions::write_osc52_stdout(&url) {
+                        Ok(_) => {
+                            "download link copied (valid 10 min): paste it into your browser".into()
+                        }
+                        Err(err) => format!("copy failed: {err} — link: {url}"),
+                    },
+                });
+            }
+            MenuAction::DownloadToLocal => {
+                let Some((path, _)) = &target else { return };
+                let user = std::env::var("USER").unwrap_or_default();
+                let command = actions::ssh_origin().and_then(|conn| {
+                    actions::scp_back_command(std::slice::from_ref(path), &user, &conn)
+                });
+                // Straight to OSC 52, never a native clipboard tool: the
+                // command is for the CONNECTING machine's clipboard, and a
+                // tool here would write this box's own clipboard instead.
+                self.notice = Some(match command {
+                    None => "not in an ssh / ET session: nowhere to download to".into(),
+                    Some(cmd) => match actions::write_osc52_stdout(&cmd) {
+                        Ok(_) => "scp command copied to your local clipboard: paste it in a terminal there".into(),
+                        Err(err) => format!("copy failed: {err}"),
+                    },
                 });
             }
             MenuAction::Rename => {
@@ -2948,6 +3264,33 @@ impl App {
             self.change_folder(&input);
             return;
         }
+        if let PromptKind::NewEntry(dir) = &kind {
+            let folder = input.trim().ends_with('/');
+            let Some(name) = actions::validate_name(input.trim().trim_end_matches('/')) else {
+                self.notice = Some("invalid name".into());
+                return;
+            };
+            let result = if folder {
+                actions::create_folder(dir, name)
+            } else {
+                actions::create_file(dir, name)
+            };
+            match result {
+                Ok(created) => {
+                    self.tree.expand(dir);
+                    self.refresh_tree();
+                    if let Some(index) = self.rows.iter().position(|r| r.path == created) {
+                        self.select(index);
+                    }
+                }
+                Err(err) => self.notice = Some(format!("failed: {err}")),
+            }
+            return;
+        }
+        if matches!(kind, PromptKind::Find) {
+            self.apply_find(&input);
+            return;
+        }
         if matches!(kind, PromptKind::CustomEditor) {
             if sidebar::save_editor_command(&input) {
                 self.notice = Some("custom editor saved; Enter still previews files".into());
@@ -2966,6 +3309,7 @@ impl App {
             PromptKind::Rename(path) => actions::rename(path, name),
             PromptKind::ChangeFolder => unreachable!("handled above"),
             PromptKind::CustomEditor => unreachable!("handled above"),
+            PromptKind::Find | PromptKind::NewEntry(_) => unreachable!("handled above"),
         };
         match result {
             Ok(created) => {
@@ -3023,6 +3367,120 @@ impl App {
     /// The visible row index at a pane-local mouse row, if it lands on one.
     fn row_at(&self, mouse_row: u16) -> Option<usize> {
         row_index_at(self.body, self.rows.len(), mouse_row)
+    }
+
+    /// Run a `/` find: reveal every match (expand the folders above it),
+    /// highlight them, and put the cursor on the first one in tree order.
+    fn apply_find(&mut self, query: &str) {
+        let root = self.tree.root_path();
+        let (found, truncated) =
+            herdr_sidebar::find::find_paths(&root, query, self.tree.show_hidden, FIND_LIMIT);
+        if found.is_empty() {
+            self.find = None;
+            self.notice = Some(format!("find: no match for \"{}\"", query.trim()));
+            return;
+        }
+        for path in &found {
+            let mut dir = path.parent();
+            while let Some(d) = dir {
+                if !d.starts_with(&root) || d == root {
+                    break;
+                }
+                self.tree.expand(d);
+                dir = d.parent();
+            }
+        }
+        self.find = Some(FindState {
+            query: query.trim().to_string(),
+            matches: found.iter().cloned().collect(),
+        });
+        self.rebuild();
+        self.selected = None;
+        self.jump_to_match(true);
+        self.notice = Some(format!(
+            "find \"{}\": {}{} match{} · n/N next/prev · esc clear",
+            query.trim(),
+            found.len(),
+            if truncated { "+" } else { "" },
+            if found.len() == 1 { "" } else { "es" },
+        ));
+    }
+
+    /// `n` / `N`: the next / previous highlighted row, wrapping around.
+    fn jump_to_match(&mut self, forward: bool) {
+        let Some(find) = &self.find else { return };
+        let hits: Vec<usize> = (0..self.rows.len())
+            .filter(|&i| find.matches.contains(&self.rows[i].path))
+            .collect();
+        let (Some(&first), Some(&last)) = (hits.first(), hits.last()) else {
+            return;
+        };
+        let next = match (self.selected, forward) {
+            (None, true) => first,
+            (None, false) => last,
+            (Some(cur), true) => hits.iter().copied().find(|&i| i > cur).unwrap_or(first),
+            (Some(cur), false) => hits
+                .iter()
+                .rev()
+                .copied()
+                .find(|&i| i < cur)
+                .unwrap_or(last),
+        };
+        self.select(next);
+    }
+
+    /// Tick: an upload just landed (the upload server touched its stamp), so
+    /// re-read the tree to show it.
+    fn collect_uploads(&mut self) {
+        let stamp = std::fs::metadata(herdr_sidebar::upload::stamp_path())
+            .and_then(|m| m.modified())
+            .ok();
+        if stamp.is_some() && stamp != self.upload_seen {
+            self.upload_seen = stamp;
+            self.refresh_tree();
+        }
+    }
+
+    /// Where `a` and `p` act: the selected folder, a selected file's
+    /// folder, or the root.
+    fn target_dir(&self) -> PathBuf {
+        match self.selected_row() {
+            Some(row) if row.is_dir => row.path.clone(),
+            Some(row) => row
+                .path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.tree.root_path()),
+            None => self.tree.root_path(),
+        }
+    }
+
+    /// `p`: paste a copy of what `yy` yanked into [`Self::target_dir`].
+    fn paste_yanked(&mut self) {
+        let Some(source) = self.yanked.clone() else {
+            self.notice = Some("nothing yanked (yy first)".into());
+            return;
+        };
+        let dir = self.target_dir();
+        let name = source
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let dest = actions::free_copy_name(&dir, &name);
+        match actions::copy_recursive(&source, &dest) {
+            Ok(()) => {
+                self.tree.expand(&dir);
+                self.refresh_tree();
+                if let Some(index) = self.rows.iter().position(|r| r.path == dest) {
+                    self.select(index);
+                }
+                self.notice = Some(format!(
+                    "pasted {}",
+                    dest.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+            Err(err) => self.notice = Some(format!("paste failed: {err}")),
+        }
     }
 
     fn selected_row(&self) -> Option<&Row> {
@@ -3229,6 +3687,24 @@ impl App {
             let theme = self.theme;
             let hovered = self.hovered;
             let selected = self.selected;
+            let path_at =
+                |i: Option<usize>| i.and_then(|i| self.rows.get(i)).map(|r| r.path.clone());
+            let (selected_path, hovered_path) = (path_at(selected), path_at(hovered));
+            track_marquee(&mut self.marquee_selected, selected_path);
+            track_marquee(&mut self.marquee_hovered, hovered_path);
+            let since = |slot: &Option<(PathBuf, std::time::Instant)>, i: usize| {
+                slot.as_ref()
+                    .filter(|(path, _)| self.rows.get(i).is_some_and(|r| &r.path == path))
+                    .map(|(_, at)| at.elapsed())
+            };
+            let visible = self.scroll..self.scroll + h;
+            self.marquee_live = [selected, hovered].into_iter().flatten().any(|i| {
+                visible.contains(&i)
+                    && self
+                        .rows
+                        .get(i)
+                        .is_some_and(|r| name_overflows(r, theme, self.row_deco(r), body.width))
+            });
             let items: Vec<ListItem> = self
                 .rows
                 .iter()
@@ -3241,8 +3717,13 @@ impl App {
                         theme,
                         hovered == Some(i),
                         selected == Some(i),
+                        self.find
+                            .as_ref()
+                            .is_some_and(|f| f.matches.contains(&r.path)),
                         self.row_deco(r),
                         body.width,
+                        since(&self.marquee_selected, i)
+                            .or_else(|| since(&self.marquee_hovered, i)),
                     )
                 })
                 .collect();
@@ -3398,7 +3879,10 @@ impl App {
         };
         // The name yields to the buttons and gear in narrow panes.
         let avail = usize::from(area.width.saturating_sub(gear_w + actions_w));
-        let root_label = truncate_to(format!(" {}", self.tree.root_name().to_uppercase()), avail);
+        let root_label = format!(
+            " {}",
+            truncate_left(&self.header_path, avail.saturating_sub(1))
+        );
         let name = Span::styled(
             root_label,
             Style::default().bold().fg(palette().header_accent),
@@ -3446,6 +3930,12 @@ impl App {
             ("r", "refresh"),
             (".", "dotfiles"),
             ("c", "folder"),
+            ("/", "find"),
+            ("e", "edit"),
+            ("a", "new"),
+            ("R", "rename"),
+            ("dd", "delete"),
+            ("yy/p", "copy"),
             ("ctrl+p", "files"),
             ("ctrl+f", "text"),
             ("m", "menu"),
@@ -4598,15 +5088,31 @@ fn deco_name_style(letter: Option<char>) -> Style {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn row_item(
     row: &Row,
     theme: IconTheme,
     hovered: bool,
     selected: bool,
+    matched: bool,
     deco: Option<char>,
     width: u16,
+    marquee: Option<std::time::Duration>,
 ) -> ListItem<'static> {
-    let item = ListItem::new(row_line(row, theme, deco, width));
+    let mut line = row_line(row, theme, deco, width, marquee);
+    if matched {
+        // A `/` find match: bold + underlined name in the "modified" colour.
+        // Foreground-only like decorations, so the selection bg still shows.
+        for span in &mut line.spans {
+            if span.content.trim() == row.name {
+                span.style = span
+                    .style
+                    .fg(palette().modified)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+            }
+        }
+    }
+    let item = ListItem::new(line);
     match row_bg(hovered, selected) {
         Some(style) => item.style(style),
         None => item,
@@ -4628,7 +5134,65 @@ fn row_bg(hovered: bool, selected: bool) -> Option<Style> {
 
 /// One tree row's content: indent, chevron, icon, name, and the right-aligned
 /// git decoration.
-fn row_line(row: &Row, theme: IconTheme, deco: Option<char>, width: u16) -> Line<'static> {
+/// Cells left for the name once the indent, chevron, icon and any git marker
+/// have theirs — the same arithmetic [`row_line`] lays the row out with.
+fn name_avail(row: &Row, theme: IconTheme, deco: Option<char>, width: u16) -> usize {
+    let icon = icon(theme, &row.name, row.is_dir, row.expanded);
+    let prefix = row.depth * 2 + 2 + Span::raw(format!("{} ", icon.glyph)).width();
+    let marker = deco.and_then(|letter| deco_marker(letter, row.is_dir && !row.is_symlink));
+    let tail = if marker.is_some() { 4 } else { 0 };
+    usize::from(width).saturating_sub(prefix + tail)
+}
+
+/// Whether `row`'s name is cut off at `width` (and so worth a marquee).
+fn name_overflows(row: &Row, theme: IconTheme, deco: Option<char>, width: u16) -> bool {
+    Span::raw(row.name.as_str()).width() > name_avail(row, theme, deco, width)
+}
+
+const MARQUEE_START_PAUSE: u128 = 800;
+const MARQUEE_STEP: u128 = 150;
+/// What separates the end of the name from its next lap in the ticker.
+const MARQUEE_GAP: &str = "   ·   ";
+
+/// Cells into the endless ticker (`name·name·…`, one lap = `lap` cells) to
+/// start the window at, `elapsed` into the marquee: a short hold so the start
+/// of the name can be read, then one cell per step, round and round.
+fn marquee_offset(elapsed: std::time::Duration, lap: usize) -> usize {
+    let t = elapsed.as_millis();
+    if lap == 0 || t < MARQUEE_START_PAUSE {
+        return 0;
+    }
+    (((t - MARQUEE_START_PAUSE) / MARQUEE_STEP) as usize) % lap
+}
+
+/// The `avail`-cell window of `name` starting `offset` cells in (a wide
+/// character straddling the start is skipped whole, never split).
+fn marquee_window(name: &str, offset: usize, avail: usize) -> String {
+    let (mut skipped, mut used, mut out) = (0, 0, String::new());
+    for c in name.chars() {
+        let w = c.width().unwrap_or(0);
+        if skipped < offset {
+            skipped += w;
+            continue;
+        }
+        if used + w > avail {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out
+}
+
+/// One tree row; `marquee` (time since the row became active) scrolls a
+/// name too long for the row instead of ellipsizing it.
+fn row_line(
+    row: &Row,
+    theme: IconTheme,
+    deco: Option<char>,
+    width: u16,
+    marquee: Option<std::time::Duration>,
+) -> Line<'static> {
     let indent = "  ".repeat(row.depth);
     let arrow = if row.is_dir {
         if row.expanded { "▾ " } else { "▸ " }
@@ -4654,7 +5218,16 @@ fn row_line(row: &Row, theme: IconTheme, deco: Option<char>, width: u16) -> Line
     let tail = if marker.is_some() { 4 } else { 0 };
     let used: usize = spans.iter().map(Span::width).sum();
     let avail = usize::from(width).saturating_sub(used + tail);
-    let name = truncate_to(row.name.clone(), avail);
+    let name_cells = Span::raw(row.name.as_str()).width();
+    let name = match marquee {
+        Some(elapsed) if name_cells > avail => {
+            // Two laps back to back, so every window of one lap is in it.
+            let ticker = format!("{}{MARQUEE_GAP}{}", row.name, row.name);
+            let lap = name_cells + Span::raw(MARQUEE_GAP).width();
+            marquee_window(&ticker, marquee_offset(elapsed, lap), avail)
+        }
+        _ => truncate_to(row.name.clone(), avail),
+    };
     let name_width = Span::raw(name.as_str()).width();
     spans.push(Span::styled(name, deco_name_style(deco)));
     if let Some(marker) = marker {
@@ -4669,6 +5242,64 @@ fn row_line(row: &Row, theme: IconTheme, deco: Option<char>, width: u16) -> Line
         spans.push(Span::raw("  "));
     }
     Line::from(spans)
+}
+
+/// The header path for `root`: inside a git project `<repo>/<rel>` (just
+/// `<repo>` at its top), found by walking up to the nearest `.git` (a folder,
+/// or a worktree's / submodule's `.git` file); elsewhere the path with the
+/// home folder shown as `~`.
+fn header_path(root: &Path) -> String {
+    let repo = root.ancestors().find(|dir| dir.join(".git").exists());
+    if let Some(repo) = repo {
+        let name = repo
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| repo.display().to_string());
+        let rel = root.strip_prefix(repo).unwrap_or(Path::new(""));
+        return if rel.as_os_str().is_empty() {
+            name
+        } else {
+            format!("{name}/{}", rel.display())
+        };
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    match home.as_deref().and_then(|h| root.strip_prefix(h).ok()) {
+        Some(rel) if rel.as_os_str().is_empty() => "~".into(),
+        Some(rel) => format!("~/{}", rel.display()),
+        None => root.display().to_string(),
+    }
+}
+
+/// `s` cut to `max` cells from the LEFT (`…` + its tail), so a long path
+/// keeps the folder you are in visible.
+fn truncate_left(s: &str, max: usize) -> String {
+    if Span::raw(s).width() <= max {
+        return s.to_string();
+    }
+    if max < 2 {
+        return String::new();
+    }
+    let mut tail: Vec<char> = Vec::new();
+    let mut used = 1; // the ellipsis
+    for c in s.chars().rev() {
+        let w = c.width().unwrap_or(0);
+        if used + w > max {
+            break;
+        }
+        tail.push(c);
+        used += w;
+    }
+    std::iter::once('…').chain(tail.into_iter().rev()).collect()
+}
+
+/// Keep a marquee's start time while the same row stays active; restart it
+/// when another row becomes active; drop it when none is.
+fn track_marquee(slot: &mut Option<(PathBuf, std::time::Instant)>, path: Option<PathBuf>) {
+    match (slot.as_ref(), path) {
+        (Some((current, _)), Some(path)) if *current == path => {}
+        (_, Some(path)) => *slot = Some((path, std::time::Instant::now())),
+        (_, None) => *slot = None,
+    }
 }
 
 /// Next selectable (non-separator) menu index in `direction`, staying put at
@@ -4801,7 +5432,7 @@ mod tests {
 
     #[test]
     fn menu_navigation_skips_separators_and_clamps() {
-        let entries = actions::menu_entries(Some(false), true);
+        let entries = actions::menu_entries(Some(false), true, false);
         // First entry is an action; stepping up from it stays put.
         assert_eq!(step_menu(&entries, 0, -1), 0);
         // Stepping down over a separator lands on the next action.
@@ -4958,7 +5589,7 @@ mod tests {
 
     /// The rendered text of a row, decorations included.
     fn rendered(row: &Row, deco: Option<char>, width: u16) -> String {
-        row_line(row, IconTheme::Emoji, deco, width)
+        row_line(row, IconTheme::Emoji, deco, width, None)
             .spans
             .iter()
             .map(|s| s.content.as_ref())
@@ -4996,6 +5627,92 @@ mod tests {
             depth: 0,
             expanded: false,
         }
+    }
+
+    #[test]
+    fn the_header_shows_the_path_inside_the_git_project() {
+        let base = std::env::temp_dir().join(format!("hs-header-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("proj/.git")).unwrap();
+        std::fs::create_dir_all(base.join("proj/src/deep")).unwrap();
+        std::fs::create_dir_all(base.join("loose")).unwrap();
+        assert_eq!(header_path(&base.join("proj")), "proj");
+        assert_eq!(header_path(&base.join("proj/src/deep")), "proj/src/deep");
+        // A worktree / submodule has a .git FILE: still a project root.
+        std::fs::create_dir_all(base.join("proj/vendor/lib")).unwrap();
+        std::fs::write(
+            base.join("proj/vendor/.git"),
+            "gitdir: ../.git/modules/vendor",
+        )
+        .unwrap();
+        assert_eq!(header_path(&base.join("proj/vendor/lib")), "vendor/lib");
+        assert!(header_path(&base.join("loose")).ends_with("loose"));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_long_header_path_keeps_its_tail() {
+        assert_eq!(truncate_left("repo/a/b", 20), "repo/a/b");
+        assert_eq!(
+            truncate_left("repo/plugins/herdr-sidebar/src", 12),
+            "…sidebar/src"
+        );
+        assert_eq!(truncate_left("報告/資料夾", 6), "…料夾");
+    }
+
+    #[test]
+    fn a_marquee_holds_briefly_then_loops_forever() {
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(marquee_offset(ms(0), 10), 0);
+        assert_eq!(marquee_offset(ms(799), 10), 0, "short start hold");
+        assert_eq!(marquee_offset(ms(800 + 150), 10), 1);
+        assert_eq!(marquee_offset(ms(800 + 150 * 9), 10), 9);
+        assert_eq!(
+            marquee_offset(ms(800 + 150 * 10), 10),
+            0,
+            "next lap, no stop"
+        );
+        assert_eq!(
+            marquee_offset(ms(800 + 150 * 23), 10),
+            3,
+            "and the one after"
+        );
+    }
+
+    #[test]
+    fn a_marquee_window_slides_by_cells_and_never_splits_wide_chars() {
+        assert_eq!(marquee_window("abcdefgh", 0, 4), "abcd");
+        assert_eq!(marquee_window("abcdefgh", 4, 4), "efgh");
+        assert_eq!(
+            marquee_window("報告abc", 1, 4),
+            "告ab",
+            "half of 報 is skipped whole"
+        );
+        assert_eq!(marquee_window("報告abc", 2, 4), "告ab");
+    }
+
+    #[test]
+    fn a_long_active_name_scrolls_instead_of_ellipsizing() {
+        let row = file_row("a-very-long-file-name-that-will-not-fit.rs");
+        let text = |marquee| {
+            row_line(&row, IconTheme::Emoji, None, 20, marquee)
+                .spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        assert!(text(None).ends_with('…'));
+        let start = text(Some(std::time::Duration::ZERO));
+        let later = text(Some(std::time::Duration::from_millis(800 + 150 * 3)));
+        assert!(!start.contains('…') && start.contains("a-very"), "{start}");
+        assert!(
+            later.contains("ery-long") && !later.contains("a-very"),
+            "{later}"
+        );
+        // Near the end of a lap the name's tail, the gap and its head share
+        // the window: it wraps round instead of stopping.
+        let wrap = text(Some(std::time::Duration::from_millis(800 + 150 * 41)));
+        assert!(wrap.contains('·') && wrap.contains("a-ve"), "{wrap}");
     }
 
     #[test]
@@ -5038,7 +5755,7 @@ mod tests {
         );
         assert_eq!(row_bg(false, false), None);
         // The decoration itself only ever sets a foreground.
-        let name_spans = row_line(&file_row("app.rs"), IconTheme::Emoji, Some('M'), 30);
+        let name_spans = row_line(&file_row("app.rs"), IconTheme::Emoji, Some('M'), 30, None);
         assert!(name_spans.spans.iter().all(|s| s.style.bg.is_none()));
         assert_eq!(deco_name_style(Some('M')).fg, Some(status_color('M')));
         assert_eq!(deco_name_style(Some('M')).bg, None);

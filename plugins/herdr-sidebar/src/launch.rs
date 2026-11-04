@@ -414,6 +414,46 @@ pub(crate) fn is_preview_label(label: &str) -> bool {
 /// Eligible panes in our tab, sorted by pane id so the fallback is stable.
 /// `foreground_cwd` is deliberately required: falling back to `cwd` would
 /// resurrect a stale spawn directory when the host has no live cwd signal.
+/// The marker the focus hook touches when focus enters `tab_id`, so the
+/// sidebar in that tab starts following its neighbour's cwd promptly
+/// without polling pane.list just to learn it has focus.
+pub fn focus_marker(tab_id: &str) -> std::path::PathBuf {
+    let name: String = tab_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    crate::rundir::dir("focus").join(name)
+}
+
+/// The tab `my_pane_id` sits in, from a `pane.list` answer.
+pub fn tab_of_pane(pane_list_json: &str, my_pane_id: &str) -> Option<String> {
+    let msg = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)).ok()?;
+    msg.result
+        .panes
+        .iter()
+        .find(|p| p.pane_id.as_deref() == Some(my_pane_id))
+        .and_then(|me| me.tab_id.clone())
+}
+
+/// Whether focus is inside `my_pane_id`'s tab (on it or on a sibling): the
+/// moment a `cd` next to the sidebar should show up promptly.
+pub fn tab_has_focus(pane_list_json: &str, my_pane_id: &str) -> bool {
+    let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
+        return false;
+    };
+    let panes = &msg.result.panes;
+    let Some(tab) = panes
+        .iter()
+        .find(|p| p.pane_id.as_deref() == Some(my_pane_id))
+        .and_then(|me| me.tab_id.as_deref())
+    else {
+        return false;
+    };
+    panes
+        .iter()
+        .any(|p| p.focused && p.tab_id.as_deref() == Some(tab))
+}
+
 fn sibling_cwds(pane_list_json: &str, my_pane_id: &str) -> Vec<SiblingCwd> {
     let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
         return Vec::new();

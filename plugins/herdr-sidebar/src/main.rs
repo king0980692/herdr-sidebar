@@ -49,6 +49,34 @@ fn main() -> std::io::Result<()> {
             return herdr_sidebar::updates::run().map_err(std::io::Error::other);
         }
         Some("--refresh-sidebars") => return herdr_sidebar::updates::refresh(),
+        Some("--autoclose") => return ensure::autoclose(),
+        Some("--serve-site") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            let [file, bind_ip] = args.as_slice() else {
+                return Err(std::io::Error::other(
+                    "usage: --serve-site <file> <bind-ip>",
+                ));
+            };
+            return herdr_sidebar::site::run(std::path::Path::new(file), bind_ip);
+        }
+        Some("--serve-upload") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            let [dir, bind_ip] = args.as_slice() else {
+                return Err(std::io::Error::other(
+                    "usage: --serve-upload <dir> <bind-ip>",
+                ));
+            };
+            return herdr_sidebar::upload::run(std::path::Path::new(dir), bind_ip);
+        }
+        Some("--serve-download") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            let [path, bind_ip] = args.as_slice() else {
+                return Err(std::io::Error::other(
+                    "usage: --serve-download <path> <bind-ip>",
+                ));
+            };
+            return herdr_sidebar::serve::run(std::path::Path::new(path), bind_ip);
+        }
         Some("--run-custom-editor") => return herdr_sidebar::actions::run_configured_editor(),
         Some("--launch-decision") => {
             // Optional second arg picks the source-control decision; default
@@ -521,8 +549,10 @@ fn run_explorer(
         terminal.draw(|frame| app.draw(frame))?;
         // 500ms: quick enough that a finished folder pick lands promptly,
         // still cheap for the heartbeat.
-        let timeout = if app.is_syncing() {
+        let timeout = if app.is_syncing() || app.marquee_live() {
             ANIMATION_FRAME
+        } else if app.follows_fast() {
+            Duration::from_millis(200)
         } else {
             Duration::from_millis(500)
         };

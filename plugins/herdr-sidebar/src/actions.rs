@@ -19,6 +19,18 @@ pub enum MenuAction {
     Reveal,
     ChangeFolder,
     ChangeFolderTyped,
+    /// Over ssh / ET: put an `scp` command that pulls the target back to the
+    /// connecting machine on THAT machine's clipboard (OSC 52).
+    DownloadToLocal,
+    /// Over ssh / ET: serve the target once over HTTP on the address the
+    /// client used, and put the link on the client's clipboard.
+    DownloadViaBrowser,
+    /// Over ssh / ET: serve an upload page for the target's folder, and put
+    /// its link on the client's clipboard.
+    UploadHere,
+    /// Over ssh / ET: serve the file's folder and put the file's link on the
+    /// client's clipboard, to view it (HTML with its assets, SVG, PDF, …).
+    OpenInBrowser,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -34,17 +46,30 @@ pub enum MenuEntry {
 /// "Reveal in File Explorer" already does. `in_repo` adds "Stage Changes"
 /// (issue #20) — it stays out of the menu entirely when the target is not
 /// inside a git repository, so the entry never offers an action that can only
-/// fail.
-pub fn menu_entries(target: Option<bool>, in_repo: bool) -> Vec<MenuEntry> {
+/// fail. `remote` (the sidebar is reached over ssh / ET) adds "Download to
+/// Local" for a row, which copies an scp command for the connecting machine.
+pub fn menu_entries(target: Option<bool>, in_repo: bool, remote: bool) -> Vec<MenuEntry> {
     let mut entries = vec![
         MenuEntry::Action(MenuAction::NewFile, "New File…"),
         MenuEntry::Action(MenuAction::NewFolder, "New Folder…"),
     ];
+    if remote {
+        entries.push(MenuEntry::Action(
+            MenuAction::UploadHere,
+            "Upload Here (copy link)",
+        ));
+    }
     if target == Some(false) {
         entries.extend([
             MenuEntry::Separator,
             MenuEntry::Action(MenuAction::OpenExternal, "Open with Default App"),
         ]);
+        if remote {
+            entries.push(MenuEntry::Action(
+                MenuAction::OpenInBrowser,
+                "Open in Browser (copy link)",
+            ));
+        }
     }
     if target.is_some() && in_repo {
         entries.extend([
@@ -57,6 +82,17 @@ pub fn menu_entries(target: Option<bool>, in_repo: bool) -> Vec<MenuEntry> {
             MenuEntry::Separator,
             MenuEntry::Action(MenuAction::CopyPath, "Copy Path"),
             MenuEntry::Action(MenuAction::CopyRelativePath, "Copy Relative Path"),
+        ]);
+        if remote {
+            entries.extend([
+                MenuEntry::Action(
+                    MenuAction::DownloadViaBrowser,
+                    "Download via Browser (copy link)",
+                ),
+                MenuEntry::Action(MenuAction::DownloadToLocal, "Download to Local (copy scp)"),
+            ]);
+        }
+        entries.extend([
             MenuEntry::Separator,
             MenuEntry::Action(MenuAction::Rename, "Rename…"),
             MenuEntry::Action(MenuAction::Delete, "Delete"),
@@ -846,6 +882,145 @@ pub fn pick_folder(start: &Path) -> Option<PathBuf> {
     }
 }
 
+/// The `SSH_CONNECTION` ("client_ip client_port server_ip server_port") of the
+/// ssh / ET session this sidebar is being used through, if any.
+///
+/// A herdr pane inherits the SERVER's environment, captured when the server
+/// started, so a later ssh login never shows up in our own env. The attached
+/// client process holds the real terminal, so read it from there — the most
+/// recently started `herdr` (or `tmux`) client that carries one. ET sessions
+/// carry it too: ET bootstraps over ssh and passes it on.
+pub fn ssh_origin() -> Option<String> {
+    if let Some(conn) = std::env::var("SSH_CONNECTION")
+        .ok()
+        .filter(|c| !c.trim().is_empty())
+    {
+        return Some(conn);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut best: Option<(u64, String)> = None;
+        for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+            let dir = entry.path();
+            let comm = std::fs::read_to_string(dir.join("comm")).unwrap_or_default();
+            if !matches!(comm.trim(), "herdr" | "tmux") {
+                continue;
+            }
+            let Ok(environ) = std::fs::read(dir.join("environ")) else {
+                continue;
+            };
+            let Some(conn) = environ
+                .split(|b| *b == 0)
+                .find_map(|var| var.strip_prefix(b"SSH_CONNECTION="))
+                .map(|v| String::from_utf8_lossy(v).into_owned())
+                .filter(|c| !c.trim().is_empty())
+            else {
+                continue;
+            };
+            // Field 22 of /proc/<pid>/stat is the start time; the command name
+            // (field 2) may contain spaces, so count from its closing paren.
+            let stat = std::fs::read_to_string(dir.join("stat")).unwrap_or_default();
+            let start = stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().nth(19))
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            if best.as_ref().is_none_or(|(s, _)| start > *s) {
+                best = Some((start, conn));
+            }
+        }
+        best.map(|(_, conn)| conn)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Copy a file, or a folder with everything in it, to a path that must not
+/// exist yet.
+pub fn copy_recursive(from: &Path, to: &Path) -> io::Result<()> {
+    if to.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} already exists", to.display()),
+        ));
+    }
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if std::fs::symlink_metadata(from)?.is_dir() {
+        std::fs::create_dir(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            copy_recursive(&entry.path(), &to.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(from, to).map(drop)
+    }
+}
+
+/// A free name next to `path` for a pasted copy: `name`, then `name copy`,
+/// `name copy 2`, … (before the extension for files).
+pub fn free_copy_name(dir: &Path, name: &str) -> PathBuf {
+    let candidate = dir.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem, format!(".{ext}")),
+        _ => (name, String::new()),
+    };
+    (1..)
+        .map(|n| {
+            let suffix = if n == 1 {
+                " copy".to_string()
+            } else {
+                format!(" copy {n}")
+            };
+            dir.join(format!("{stem}{suffix}{ext}"))
+        })
+        .find(|p| !p.exists())
+        .expect("an unbounded range always finds a free name")
+}
+
+/// SSH_CONNECTION's server ip: the address the client used to reach this
+/// machine, and so the one address it can surely reach a download server on.
+pub fn ssh_server_ip(connection: &str) -> Option<String> {
+    connection.split_whitespace().nth(2).map(str::to_string)
+}
+
+/// `scp -r [-P port] user@host:'path' … .` — run on the connecting machine,
+/// it pulls `paths` back there. The host is SSH_CONNECTION's server_ip:port:
+/// the address that machine itself used to reach this one (a Tailscale 100.x
+/// address, or 127.0.0.1 through WSL's localhost forwarding), so it needs no
+/// per-client setup. `None` when `connection` is malformed or `paths` empty.
+pub fn scp_back_command(paths: &[PathBuf], user: &str, connection: &str) -> Option<String> {
+    let mut fields = connection.split_whitespace().skip(2);
+    let host = fields.next()?;
+    let port = fields.next().unwrap_or("22");
+    if paths.is_empty() || user.is_empty() {
+        return None;
+    }
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let mut cmd = String::from("scp -r");
+    if port != "22" {
+        cmd.push_str(&format!(" -P {port}"));
+    }
+    for path in paths {
+        // Single-quote for the shell it gets pasted into ('\'' for a quote).
+        let quoted = path.to_string_lossy().replace('\'', "'\\''");
+        cmd.push_str(&format!(" {user}@{host}:'{quoted}'"));
+    }
+    cmd.push_str(" .");
+    Some(cmd)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -865,10 +1040,10 @@ mod tests {
 
     #[test]
     fn menu_shape_for_rows_and_root() {
-        let row = menu_entries(Some(false), true);
+        let row = menu_entries(Some(false), true, false);
         assert!(matches!(row[0], MenuEntry::Action(MenuAction::NewFile, _)));
         assert!(has(&row, MenuAction::Delete));
-        let root = menu_entries(None, true);
+        let root = menu_entries(None, true, false);
         assert!(!has(&root, MenuAction::Rename));
         assert!(has(&root, MenuAction::Reveal));
     }
@@ -876,40 +1051,52 @@ mod tests {
     #[test]
     fn open_external_is_offered_for_files_only() {
         assert!(
-            has(&menu_entries(Some(false), true), MenuAction::OpenExternal),
+            has(
+                &menu_entries(Some(false), true, false),
+                MenuAction::OpenExternal
+            ),
             "file row"
         );
         assert!(
-            !has(&menu_entries(Some(true), true), MenuAction::OpenExternal),
+            !has(
+                &menu_entries(Some(true), true, false),
+                MenuAction::OpenExternal
+            ),
             "directory row"
         );
         assert!(
-            !has(&menu_entries(None, true), MenuAction::OpenExternal),
+            !has(&menu_entries(None, true, false), MenuAction::OpenExternal),
             "empty space"
         );
         // Directories keep everything else they had.
-        assert!(has(&menu_entries(Some(true), true), MenuAction::Rename));
+        assert!(has(
+            &menu_entries(Some(true), true, false),
+            MenuAction::Rename
+        ));
     }
 
     #[test]
     fn stage_is_offered_for_rows_inside_a_repo_only() {
         assert!(
-            has(&menu_entries(Some(false), true), MenuAction::Stage),
+            has(&menu_entries(Some(false), true, false), MenuAction::Stage),
             "file row"
         );
         assert!(
-            has(&menu_entries(Some(true), true), MenuAction::Stage),
+            has(&menu_entries(Some(true), true, false), MenuAction::Stage),
             "directory row"
         );
         assert!(
-            !has(&menu_entries(None, true), MenuAction::Stage),
+            !has(&menu_entries(None, true, false), MenuAction::Stage),
             "empty space"
         );
         assert!(
-            !has(&menu_entries(Some(false), false), MenuAction::Stage),
+            !has(&menu_entries(Some(false), false, false), MenuAction::Stage),
             "outside a repo"
         );
-        assert!(!has(&menu_entries(Some(true), false), MenuAction::Stage));
+        assert!(!has(
+            &menu_entries(Some(true), false, false),
+            MenuAction::Stage
+        ));
     }
 
     #[test]
@@ -1136,5 +1323,64 @@ mod tests {
         );
         assert_eq!(bytes, b"\x1b]52;c;aGVsbG8=\x07");
         assert!(write_osc52(Vec::new(), "").is_err());
+    }
+    #[test]
+    fn scp_back_targets_the_address_the_client_used() {
+        let conn = "100.113.124.17 61222 100.65.126.110 22";
+        let paths = [
+            PathBuf::from("/home/u/a b.txt"),
+            PathBuf::from("/home/u/it's"),
+        ];
+        assert_eq!(
+            scp_back_command(&paths, "u", conn).unwrap(),
+            "scp -r u@100.65.126.110:'/home/u/a b.txt' u@100.65.126.110:'/home/u/it'\\''s' ."
+        );
+        let other_port = scp_back_command(&paths[..1], "u", "1.2.3.4 5 127.0.0.1 2222").unwrap();
+        assert!(
+            other_port.starts_with("scp -r -P 2222 u@127.0.0.1:"),
+            "{other_port}"
+        );
+        let v6 = scp_back_command(&paths[..1], "u", "::1 5 fe80::1 22").unwrap();
+        assert!(v6.contains("u@[fe80::1]:"), "{v6}");
+        assert_eq!(scp_back_command(&paths, "u", "garbage"), None);
+        assert_eq!(scp_back_command(&[], "u", conn), None);
+    }
+
+    #[test]
+    fn download_entry_only_over_ssh_and_only_for_rows() {
+        let has = |entries: &[MenuEntry]| {
+            entries
+                .iter()
+                .any(|e| matches!(e, MenuEntry::Action(MenuAction::DownloadToLocal, _)))
+        };
+        assert!(has(&menu_entries(Some(false), false, true)));
+        assert!(has(&menu_entries(Some(true), false, true)));
+        assert!(!has(&menu_entries(Some(false), false, false)));
+        assert!(!has(&menu_entries(None, false, true)));
+    }
+
+    #[test]
+    fn upload_entry_over_ssh_for_rows_and_empty_space() {
+        let has = |entries: &[MenuEntry]| {
+            entries
+                .iter()
+                .any(|e| matches!(e, MenuEntry::Action(MenuAction::UploadHere, _)))
+        };
+        assert!(has(&menu_entries(None, false, true)));
+        assert!(has(&menu_entries(Some(true), false, true)));
+        assert!(!has(&menu_entries(Some(true), false, false)));
+    }
+
+    #[test]
+    fn pasted_copies_get_free_names() {
+        let dir = std::env::temp_dir().join(format!("hs-paste-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(free_copy_name(&dir, "a.txt"), dir.join("a.txt"));
+        std::fs::write(dir.join("a.txt"), "").unwrap();
+        assert_eq!(free_copy_name(&dir, "a.txt"), dir.join("a copy.txt"));
+        std::fs::write(dir.join("a copy.txt"), "").unwrap();
+        assert_eq!(free_copy_name(&dir, "a.txt"), dir.join("a copy 2.txt"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -5794,10 +5794,18 @@ fn usage_card(
     if folded {
         return lines;
     }
-    for provider in group {
+    for (index, provider) in group.iter().enumerate() {
         if several {
-            // One section per account: its plan badge and who it is.
-            lines.push(Line::raw(""));
+            // One section per account: its plan badge and who it is. The
+            // first sits right under the header band; later ones get a
+            // light rule between them and the account above.
+            if index > 0 {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    format!(" {}", "─".repeat(width.saturating_sub(2))),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
             let mut sub = vec![Span::raw(" ")];
             let mut used = 1;
             if let Some(plan) = &provider.plan {

@@ -368,6 +368,15 @@ pub struct App {
     usage: Option<(Vec<herdr_sidebar::usage::Provider>, std::time::Instant)>,
     usage_rx: Option<std::sync::mpsc::Receiver<Vec<herdr_sidebar::usage::Provider>>>,
     usage_scroll: usize,
+    /// Folded Usage cards (by service name), the card the keyboard is on,
+    /// and from the last draw: each card's header line and the view's area,
+    /// for clicks. Folding is remembered on disk for every sidebar.
+    usage_folded: std::collections::HashSet<String>,
+    usage_cursor: usize,
+    usage_headers: Vec<(usize, String)>,
+    usage_area: Rect,
+    /// Bring the keyboard's card into view on the next draw.
+    usage_snap: bool,
     /// The header's path: `<repo>/<path inside it>` in a git project, else
     /// the `~`-abbreviated path. Set per root, so a followed `cd` (which
     /// re-roots through `App::new`) updates it.
@@ -553,6 +562,11 @@ impl App {
             usage: None,
             usage_rx: None,
             usage_scroll: 0,
+            usage_folded: load_usage_folded(),
+            usage_cursor: 0,
+            usage_headers: Vec::new(),
+            usage_area: Rect::default(),
+            usage_snap: false,
             header_path: header,
             site_servers: HashMap::new(),
             marquee_selected: None,
@@ -1506,6 +1520,16 @@ impl App {
                 MouseEventKind::ScrollDown => self.usage_scroll += 3,
                 MouseEventKind::ScrollUp => self.usage_scroll = self.usage_scroll.saturating_sub(3),
                 MouseEventKind::Down(MouseButton::Left)
+                    if hits(self.usage_area, mouse.column, mouse.row) =>
+                {
+                    let line = usize::from(mouse.row - self.usage_area.y) + self.usage_scroll;
+                    if let Some(index) = self.usage_headers.iter().position(|(at, _)| *at == line) {
+                        self.usage_cursor = index;
+                        let name = self.usage_headers[index].1.clone();
+                        self.set_usage_fold(&name, None);
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Left)
                     if hits_collapse_button(
                         mouse.column,
                         mouse.row,
@@ -1706,6 +1730,8 @@ impl App {
             DeleteConfirmed(PathBuf, bool),
             UsageRefresh,
             UsageScroll(isize),
+            UsageCard(isize),
+            UsageFold(Option<bool>),
             Picker(PickerAction),
         }
         let settings = self.settings_rows();
@@ -2022,8 +2048,11 @@ impl App {
             Some(Overlay::Usage) => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => Cmd::Close,
                 KeyCode::Char('r') => Cmd::UsageRefresh,
-                KeyCode::Down | KeyCode::Char('j') => Cmd::UsageScroll(1),
-                KeyCode::Up | KeyCode::Char('k') => Cmd::UsageScroll(-1),
+                KeyCode::Down | KeyCode::Char('j') => Cmd::UsageCard(1),
+                KeyCode::Up | KeyCode::Char('k') => Cmd::UsageCard(-1),
+                KeyCode::Enter | KeyCode::Char(' ') => Cmd::UsageFold(None),
+                KeyCode::Left | KeyCode::Char('h') => Cmd::UsageFold(Some(true)),
+                KeyCode::Right | KeyCode::Char('l') => Cmd::UsageFold(Some(false)),
                 KeyCode::PageDown => Cmd::UsageScroll(10),
                 KeyCode::PageUp => Cmd::UsageScroll(-10),
                 KeyCode::Home | KeyCode::Char('g') => Cmd::UsageScroll(-10_000),
@@ -2061,6 +2090,16 @@ impl App {
             Cmd::ToggleSetting(index) => self.toggle_setting(index),
             Cmd::AdjustWidth(wider) => self.adjust_sidebar_width(wider),
             Cmd::UsageRefresh => self.fetch_usage(),
+            Cmd::UsageCard(delta) => {
+                let last = self.usage_headers.len().saturating_sub(1);
+                self.usage_cursor = self.usage_cursor.saturating_add_signed(delta).min(last);
+                self.usage_snap = true;
+            }
+            Cmd::UsageFold(fold) => {
+                if let Some((_, name)) = self.usage_headers.get(self.usage_cursor).cloned() {
+                    self.set_usage_fold(&name, fold);
+                }
+            }
             Cmd::UsageScroll(delta) => {
                 self.usage_scroll = self.usage_scroll.saturating_add_signed(delta);
             }
@@ -3624,6 +3663,7 @@ impl App {
         if !matches!(self.overlay, Some(Overlay::Usage)) {
             self.overlay = Some(Overlay::Usage);
             self.usage_scroll = 0;
+            self.usage_folded = load_usage_folded();
         }
         if self
             .usage
@@ -3671,6 +3711,7 @@ impl App {
     fn draw_usage(&mut self, frame: &mut Frame, area: Rect) {
         let width = area.width as usize;
         let mut lines: Vec<Line> = Vec::new();
+        let mut headers = std::mem::take(&mut self.usage_headers);
         let status = match (&self.usage, self.usage_rx.is_some()) {
             (_, true) => "updating…".to_string(),
             (Some((_, at)), false) => {
@@ -3707,18 +3748,55 @@ impl App {
                     .unwrap_or(0);
                 // Accounts of the same service (adjacent) share one card.
                 let mut rest = providers.as_slice();
+                headers.clear();
                 while let Some(first) = rest.first() {
                     let group: Vec<_> = rest.iter().take_while(|p| p.name == first.name).collect();
                     rest = &rest[group.len()..];
                     lines.push(Line::raw(""));
-                    lines.extend(usage_card(&group, width, now));
+                    let name = first.name.to_string();
+                    let folded = self.usage_folded.contains(&name);
+                    let selected = headers.len() == self.usage_cursor;
+                    headers.push((lines.len(), name));
+                    lines.extend(usage_card(&group, width, now, folded, selected));
                 }
             }
         }
-        let max_scroll = lines.len().saturating_sub(area.height as usize);
+        self.usage_cursor = self.usage_cursor.min(headers.len().saturating_sub(1));
+        let height = area.height as usize;
+        // Keep the keyboard's card in view: its header, and as much of the
+        // card as fits.
+        if self.usage_snap
+            && let Some((at, _)) = headers.get(self.usage_cursor)
+        {
+            let end = headers
+                .get(self.usage_cursor + 1)
+                .map_or(lines.len(), |(next, _)| next.saturating_sub(1));
+            if *at < self.usage_scroll + 1 {
+                self.usage_scroll = at.saturating_sub(1);
+            } else if end > self.usage_scroll + height {
+                self.usage_scroll = (end.saturating_sub(height)).min(at.saturating_sub(1));
+            }
+            self.usage_snap = false;
+        }
+        let max_scroll = lines.len().saturating_sub(height);
         self.usage_scroll = self.usage_scroll.min(max_scroll);
+        self.usage_headers = headers;
+        self.usage_area = area;
         let visible: Vec<Line> = lines.into_iter().skip(self.usage_scroll).collect();
         frame.render_widget(Paragraph::new(visible), area);
+    }
+
+    /// Fold (`Some(true)`), unfold (`Some(false)`) or toggle (`None`) a
+    /// Usage card, and remember it for every sidebar.
+    fn set_usage_fold(&mut self, name: &str, fold: Option<bool>) {
+        let fold = fold.unwrap_or(!self.usage_folded.contains(name));
+        if fold {
+            self.usage_folded.insert(name.to_string());
+        } else {
+            self.usage_folded.remove(name);
+        }
+        save_usage_folded(&self.usage_folded);
+        self.usage_snap = true;
     }
 
     fn selected_row(&self) -> Option<&Row> {
@@ -3886,7 +3964,7 @@ impl App {
             let [hint, button] =
                 Layout::horizontal([Constraint::Min(0), Constraint::Length(3)]).areas(footer);
             frame.render_widget(
-                Paragraph::new(" r refresh · j/k scroll · esc back".dim()),
+                Paragraph::new(" ⏎ fold · j/k card · r refresh · esc back".dim()),
                 hint,
             );
             frame.render_widget(
@@ -5571,6 +5649,31 @@ fn truncate_left(s: &str, max: usize) -> String {
     std::iter::once('…').chain(tail.into_iter().rev()).collect()
 }
 
+/// Folded Usage cards, one service name per line, shared by every sidebar.
+fn usage_folded_path() -> PathBuf {
+    herdr_sidebar::rundir::dir("usage").join("folded")
+}
+
+fn load_usage_folded() -> std::collections::HashSet<String> {
+    std::fs::read_to_string(usage_folded_path())
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn save_usage_folded(folded: &std::collections::HashSet<String>) {
+    let path = usage_folded_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let mut names: Vec<&str> = folded.iter().map(String::as_str).collect();
+    names.sort_unstable();
+    let _ = std::fs::write(path, names.join("\n"));
+}
+
 /// How long the Usage view trusts an answer before fetching again.
 const USAGE_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -5636,6 +5739,8 @@ fn usage_card(
     group: &[&herdr_sidebar::usage::Provider],
     width: usize,
     now: i64,
+    folded: bool,
+    selected: bool,
 ) -> Vec<Line<'static>> {
     let band = Style::default().bg(palette().selection_bg);
     let worst = group
@@ -5651,7 +5756,22 @@ fn usage_card(
                 .fg(palette().muted_button_fg),
         )
     };
-    let mut head = vec![Span::styled(format!(" {} ", group[0].name), band.bold())];
+    // ▸ folded / ▾ open; the keyboard's card has it in the accent colour.
+    let chevron = if folded { "▸" } else { "▾" };
+    let chevron_style = if selected {
+        band.fg(palette().header_accent).bold()
+    } else {
+        band.dim()
+    };
+    let name_style = if selected {
+        band.bold().underlined()
+    } else {
+        band.bold()
+    };
+    let mut head = vec![
+        Span::styled(format!(" {chevron}"), chevron_style),
+        Span::styled(format!(" {} ", group[0].name), name_style),
+    ];
     if let Some(plan) = group[0].plan.as_ref().filter(|_| !several) {
         head.push(plan_badge(plan));
     }
@@ -5671,6 +5791,9 @@ fn usage_card(
             .bold(),
     ));
     let mut lines = vec![Line::from(head)];
+    if folded {
+        return lines;
+    }
     for provider in group {
         if several {
             // One section per account: its plan badge and who it is.

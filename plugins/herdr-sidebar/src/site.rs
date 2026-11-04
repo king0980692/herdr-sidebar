@@ -455,7 +455,12 @@ mod tests {
             Some(format!("{base}/%E5%A0%B1%201.html").as_str())
         );
         drop(listener);
-        assert_eq!(reuse_link(&base, Path::new("/x/a.html")), None);
+        // Not the freed port: a test running in parallel may take it. Port
+        // 1 is privileged and nothing listens there.
+        assert_eq!(
+            reuse_link("http://127.0.0.1:1/tok", Path::new("/x/a.html")),
+            None
+        );
     }
 
     #[test]

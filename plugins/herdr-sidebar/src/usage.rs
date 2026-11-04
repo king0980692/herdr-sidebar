@@ -290,11 +290,63 @@ fn capitalize(s: &str) -> String {
         .unwrap_or_default()
 }
 
+// ---- Shared cache --------------------------------------------------------
+
+/// How long a cached answer counts as current, for every consumer.
+const SHARED_TTL: i64 = 60;
+
+/// `~/.cache/agent-usage/<name>.json`: the provider's raw API answer, shared
+/// with the pi statusline (`claude-style-status.ts`), which reads and writes
+/// the same files — whichever asked last saves the other a request.
+fn shared_cache(name: &str) -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".cache"))
+        .join("agent-usage")
+        .join(format!("{name}.json"))
+}
+
+/// The cached answer while it is current; else ask, store, and return it.
+/// A failed request falls back to the stale cache, with a note of its age.
+fn cached_get(
+    name: &str,
+    url: &str,
+    headers: &[String],
+) -> (Option<Value>, Option<String>, Option<String>) {
+    let cache = shared_cache(name);
+    if age_secs(&cache).is_some_and(|age| age < SHARED_TTL)
+        && let Some(body) = read_json(cache.clone())
+    {
+        return (Some(body), None, None);
+    }
+    match get(url, headers) {
+        Ok(body) => {
+            if let Some(dir) = cache.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let tmp = cache.with_extension("json.sidebar.tmp");
+            if std::fs::write(&tmp, body.to_string()).is_ok() {
+                let _ = std::fs::rename(&tmp, &cache);
+            }
+            (Some(body), None, None)
+        }
+        Err(err) => match (read_json(cache.clone()), age_secs(&cache)) {
+            (Some(body), Some(age)) => (
+                Some(body),
+                None,
+                Some(format!("{err} · numbers from {} ago", short_age(age))),
+            ),
+            _ => (None, Some(err), None),
+        },
+    }
+}
+
 // ---- Codex -------------------------------------------------------------
 
 fn codex() -> Option<Provider> {
     let (token, account) = codex_auth()?;
-    let result = get(
+    let (body, error, note) = cached_get(
+        "codex",
         "https://chatgpt.com/backend-api/wham/usage",
         &[
             format!("Authorization: Bearer {token}"),
@@ -302,21 +354,15 @@ fn codex() -> Option<Provider> {
             "User-Agent: herdr-sidebar".into(),
         ],
     );
-    Some(match result {
-        Ok(body) => Provider {
-            name: "Codex",
-            plan: body["plan_type"].as_str().map(capitalize),
-            windows: codex_windows(&body),
-            error: None,
-            note: None,
-        },
-        Err(err) => Provider {
-            name: "Codex",
-            plan: None,
-            windows: Vec::new(),
-            error: Some(err),
-            note: None,
-        },
+    Some(Provider {
+        name: "Codex",
+        plan: body
+            .as_ref()
+            .and_then(|b| b["plan_type"].as_str())
+            .map(capitalize),
+        windows: body.as_ref().map(codex_windows).unwrap_or_default(),
+        error,
+        note,
     })
 }
 
@@ -363,28 +409,20 @@ fn codex_windows(body: &Value) -> Vec<Window> {
 
 fn opencode_go() -> Option<Provider> {
     let key = opencode_go_key()?;
-    let result = get(
+    let (body, error, note) = cached_get(
+        "opencode-go",
         "https://opencode.ai/zen/go/v1/usage",
         &[
             format!("Authorization: Bearer {key}"),
             "User-Agent: herdr-sidebar".into(),
         ],
     );
-    Some(match result {
-        Ok(body) => Provider {
-            name: "OpenCode Go",
-            plan: None,
-            windows: opencode_windows(&body),
-            error: None,
-            note: None,
-        },
-        Err(err) => Provider {
-            name: "OpenCode Go",
-            plan: None,
-            windows: Vec::new(),
-            error: Some(err),
-            note: None,
-        },
+    Some(Provider {
+        name: "OpenCode Go",
+        plan: None,
+        windows: body.as_ref().map(opencode_windows).unwrap_or_default(),
+        error,
+        note,
     })
 }
 

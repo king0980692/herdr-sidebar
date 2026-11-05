@@ -4,7 +4,9 @@
 //!
 //! Sources, each with the credentials its own CLI already keeps (a provider
 //! without credentials is simply left out):
-//! - Claude: `~/.claude/.credentials.json` → `api.anthropic.com/api/oauth/usage`
+//! - Claude: `~/.claude/.credentials.json` (on macOS the same JSON lives in the
+//!   login Keychain as "Claude Code-credentials") →
+//!   `api.anthropic.com/api/oauth/usage`
 //!   (the endpoint Claude Code's `/usage` reads). The answer is cached in
 //!   `~/.cache/claude-usage/usage.json`, the same file `claude-usage.sh`
 //!   keeps for the prompt, so whichever runs first saves the other a request.
@@ -167,8 +169,34 @@ fn backoff_secs(strikes: u32) -> i64 {
     (120_i64 << strikes.saturating_sub(1).min(4)).min(900)
 }
 
+/// Claude Code's OAuth blob: the credentials file on Linux, the login
+/// Keychain on macOS (Claude Code writes no file there).
+fn claude_credentials() -> Option<Value> {
+    if let Some(creds) = read_json(home().join(".claude/.credentials.json")) {
+        return Some(creds);
+    }
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let out = Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&out.stdout).ok()
+}
+
 fn claude() -> Option<Provider> {
-    let creds = read_json(home().join(".claude/.credentials.json"))?;
+    let creds = claude_credentials()?;
     let oauth = &creds["claudeAiOauth"];
     let token = oauth["accessToken"].as_str()?.to_string();
     let plan = oauth["subscriptionType"].as_str().map(capitalize);

@@ -36,6 +36,15 @@ source build when needed.
 The activity bar switches Usage, Explorer, Source Control, and Search instantly in one process.
 Use the mouse or press `1`, `2`, `3`, and `4`, respectively.
 
+Usage keeps agent subscription cards in an independently scrollable upper area.
+A fixed SYSTEM section below shows this machine's CPU usage, physical RAM
+used/total, and `/` filesystem usage (Linux/macOS). It samples in the background
+every 10 seconds only while Usage is open; CPU is unknown until the second
+sample. Disk usage is total minus space available to unprivileged users (so
+reserved blocks count as used). This is the machine running the sidebar, not
+the local laptop when using SSH. Missing metrics show `—`; narrow panes omit
+capacity figures, and short panes omit the section heading before metrics.
+
 ### Explorer & Preview
 
 <div align="center">

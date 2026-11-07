@@ -44,6 +44,17 @@ const MY_VIEW: View = View::Explorer;
 const DECO_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
 const TREE_SYNC_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Reserve five bottom rows, but always leave an agent row. Very short
+/// views omit the separator/title before omitting metrics.
+fn usage_sections(area: Rect) -> (Rect, Rect) {
+    let system_height = area.height.saturating_sub(1).min(5);
+    let agent_height = area.height.saturating_sub(system_height);
+    (
+        Rect::new(area.x, area.y, area.width, agent_height),
+        Rect::new(area.x, area.y + agent_height, area.width, system_height),
+    )
+}
+
 struct RepoDecorationRefresh {
     root: PathBuf,
     status: Status,
@@ -368,6 +379,7 @@ pub struct App {
     usage: Option<(Vec<herdr_sidebar::usage::Provider>, std::time::Instant)>,
     usage_rx: Option<std::sync::mpsc::Receiver<Vec<herdr_sidebar::usage::Provider>>>,
     usage_scroll: usize,
+    system_monitor: herdr_sidebar::system_metrics::Monitor,
     /// Folded Usage cards (by service name), the card the keyboard is on,
     /// and from the last draw: each card's header line and the view's area,
     /// for clicks. Folding is remembered on disk for every sidebar.
@@ -562,6 +574,7 @@ impl App {
             usage: None,
             usage_rx: None,
             usage_scroll: 0,
+            system_monitor: herdr_sidebar::system_metrics::Monitor::default(),
             usage_folded: load_usage_folded(),
             usage_cursor: 0,
             usage_headers: Vec::new(),
@@ -630,6 +643,10 @@ impl App {
         self.sync_shared_tree();
         self.collect_quick_index();
         self.collect_usage();
+        self.system_monitor.tick(
+            matches!(self.overlay, Some(Overlay::Usage)),
+            std::time::Instant::now(),
+        );
         self.collect_uploads();
         self.collect_content_search();
         self.collect_git_sync();
@@ -1518,8 +1535,12 @@ impl App {
         }
         if matches!(self.overlay, Some(Overlay::Usage)) {
             match mouse.kind {
-                MouseEventKind::ScrollDown => self.usage_scroll += 3,
-                MouseEventKind::ScrollUp => self.usage_scroll = self.usage_scroll.saturating_sub(3),
+                MouseEventKind::ScrollDown if hits(self.usage_area, mouse.column, mouse.row) => {
+                    self.usage_scroll = self.usage_scroll.saturating_add(3);
+                }
+                MouseEventKind::ScrollUp if hits(self.usage_area, mouse.column, mouse.row) => {
+                    self.usage_scroll = self.usage_scroll.saturating_sub(3);
+                }
                 MouseEventKind::Down(MouseButton::Left)
                     if hits(self.usage_area, mouse.column, mouse.row) =>
                 {
@@ -3710,6 +3731,8 @@ impl App {
     }
 
     fn draw_usage(&mut self, frame: &mut Frame, area: Rect) {
+        let (area, system_area) = usage_sections(area);
+        Self::draw_system_metrics(frame, system_area, self.system_monitor.snapshot);
         let width = area.width as usize;
         let mut lines: Vec<Line> = Vec::new();
         let mut headers = std::mem::take(&mut self.usage_headers);
@@ -3783,8 +3806,45 @@ impl App {
         self.usage_scroll = self.usage_scroll.min(max_scroll);
         self.usage_headers = headers;
         self.usage_area = area;
-        let visible: Vec<Line> = lines.into_iter().skip(self.usage_scroll).collect();
+        let visible: Vec<Line> = lines
+            .into_iter()
+            .skip(self.usage_scroll)
+            .take(height)
+            .collect();
         frame.render_widget(Paragraph::new(visible), area);
+    }
+
+    fn draw_system_metrics(
+        frame: &mut Frame,
+        area: Rect,
+        snapshot: Option<herdr_sidebar::system_metrics::Snapshot>,
+    ) {
+        if area.is_empty() {
+            return;
+        }
+        let mut lines = Vec::new();
+        if area.height >= 5 {
+            lines.push(Line::styled(
+                "─".repeat(usize::from(area.width)),
+                Style::default().dim(),
+            ));
+        }
+        if area.height >= 4 {
+            lines.push(Line::styled(
+                " SYSTEM",
+                Style::default().bold().fg(palette().header_accent),
+            ));
+        }
+        for text in herdr_sidebar::system_metrics::lines(snapshot) {
+            // Keep the label and percentage rather than clipping capacity text.
+            let text = if text.chars().count() > usize::from(area.width) {
+                text.split("  ").take(2).collect::<Vec<_>>().join("  ")
+            } else {
+                text
+            };
+            lines.push(Line::raw(text));
+        }
+        frame.render_widget(Paragraph::new(lines), area);
     }
 
     /// Fold (`Some(true)`), unfold (`Some(false)`) or toggle (`None`) a
@@ -6035,6 +6095,52 @@ fn rebuild_tree_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_split_keeps_system_fixed_and_never_overlaps() {
+        for height in 0..60 {
+            let area = Rect::new(2, 3, 36, height);
+            let (agents, system) = usage_sections(area);
+            assert_eq!(agents.height + system.height, height);
+            assert_eq!(agents.bottom(), system.y);
+            assert_eq!(system.bottom(), area.bottom());
+            assert!(system.height <= 5);
+            if height > 0 {
+                assert!(agents.height > 0);
+            }
+        }
+    }
+
+    #[test]
+    fn machine_panel_renders_in_narrow_and_short_terminals() {
+        use herdr_sidebar::system_metrics::Snapshot;
+        use ratatui::{Terminal, backend::TestBackend};
+        let snapshot = Some(Snapshot {
+            cpu_percent: Some(42.0),
+            memory: Some((4 * 1024_u64.pow(3), 16 * 1024_u64.pow(3))),
+            disk: Some((100 * 1024_u64.pow(3), 200 * 1024_u64.pow(3))),
+        });
+        for width in [1, 12, 36, 80] {
+            for height in [1, 2, 4, 6, 24, 48] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        let (agents, system) = usage_sections(frame.area());
+                        frame.render_widget(Paragraph::new("AGENT"), agents);
+                        App::draw_system_metrics(frame, system, snapshot);
+                    })
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                assert_eq!(buffer[(0, 0)].symbol(), "A");
+                if width >= 12 && height >= 4 {
+                    let bottom: String = (0..width)
+                        .map(|x| buffer[(x, height - 1)].symbol())
+                        .collect();
+                    assert!(bottom.contains("50%"), "disk stays on the bottom: {bottom}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn collapse_button_hit_region_is_header_right_edge() {

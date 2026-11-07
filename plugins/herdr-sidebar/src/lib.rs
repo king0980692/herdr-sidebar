@@ -23,6 +23,7 @@ pub mod snooze;
 pub mod state;
 pub mod suggest;
 pub mod syntax;
+pub mod system_metrics;
 pub mod takeover;
 pub mod tree;
 pub mod ui;

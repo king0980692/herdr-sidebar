@@ -37,6 +37,17 @@ The internal F9/F10/F11 keys sent by `ensure.rs` are semantic host actions
 (Explorer/Search/Source Control), not positional indexes; keep their mappings
 in both explorer and SCM views aligned with `Target::focus_key`.
 
+## Usage system metrics
+
+`system_metrics.rs` samples only while Usage is open, every 10 seconds, on a
+background worker. CPU needs a baseline; do not display its first refresh as
+0%. Keep machine metrics separate from the agent API refresh cadence and
+credentials. Query `/` directly with `statvfs` on Unix instead of enumerating
+all mounts: enumeration can hide macOS system volumes or block on unrelated
+network mounts. Disk used = total minus unprivileged available bytes. Keep the
+bottom section outside `usage_area` so scrolling/clicking metrics cannot move
+or fold the agent cards.
+
 ## Build / test / lint
 
 Run from inside the plugin directory, not the repo root:

@@ -10,7 +10,7 @@
 //!   (the endpoint Claude Code's `/usage` reads). The answer is cached in
 //!   `~/.cache/claude-usage/usage.json`, the same file `claude-usage.sh`
 //!   keeps for the prompt, so whichever runs first saves the other a request.
-//! - Codex: `~/.codex/auth.json` (else pi's `auth.json`) →
+//! - Codex: `~/.codex/auth.json`, pi's and PiG's `agent/auth.json` →
 //!   `chatgpt.com/backend-api/wham/usage`.
 //! - OpenCode Go: `$OPENCODE_API_KEY`, opencode's or pi's `auth.json` →
 //!   `opencode.ai/zen/go/v1/usage`.
@@ -22,6 +22,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::Value;
 
 /// One rate-limit window of a plan.
@@ -381,7 +382,7 @@ fn cached_get(
 // ---- Codex -------------------------------------------------------------
 
 /// One Codex login: its token, ChatGPT account id, where it came from, and
-/// (pi only) when its token expires, in unix ms.
+/// (pi/PiG only) when its token expires, in unix ms.
 struct CodexLogin {
     token: String,
     account: String,
@@ -389,7 +390,7 @@ struct CodexLogin {
     expires_ms: Option<i64>,
 }
 
-/// One card per Codex account, signed in through the Codex CLI and/or pi
+/// One entry per Codex account, signed in through the Codex CLI, pi or PiG
 /// (each keeps its own login, which may be a different account).
 fn codex() -> Vec<Provider> {
     let logins = codex_logins();
@@ -450,7 +451,7 @@ fn codex_card(
     }
 }
 
-/// The Codex CLI's login and pi's, one per distinct account.
+/// The Codex CLI's login, pi's and PiG's, one per distinct account.
 fn codex_logins() -> Vec<CodexLogin> {
     let mut logins = Vec::new();
     if let Some(auth) = read_json(home().join(".codex/auth.json")) {
@@ -467,20 +468,45 @@ fn codex_logins() -> Vec<CodexLogin> {
             });
         }
     }
-    if let Some(pi) = read_json(home().join(".pi/agent/auth.json")) {
-        let entry = &pi["openai-codex"];
-        if let (Some(t), Some(a)) = (entry["access"].as_str(), entry["accountId"].as_str())
-            && !logins.iter().any(|l| l.account == a)
-        {
-            logins.push(CodexLogin {
-                token: t.into(),
-                account: a.into(),
-                source: "pi",
-                expires_ms: entry["expires"].as_i64(),
-            });
+    for (path, source) in [
+        (".pi/agent/auth.json", "pi"),
+        (".pig/agent/auth.json", "pig"),
+    ] {
+        if let Some(auth) = read_json(home().join(path)) {
+            add_codex_login(&mut logins, &auth["openai-codex"], source);
         }
     }
     logins
+}
+
+fn add_codex_login(logins: &mut Vec<CodexLogin>, entry: &Value, source: &'static str) {
+    let Some(token) = entry["access"].as_str().filter(|t| !t.is_empty()) else {
+        return;
+    };
+    // PiG omits accountId. Read the claim only for routing the usage request;
+    // the API, not this unverified JWT payload, authenticates the token.
+    let account = entry["accountId"]
+        .as_str()
+        .filter(|a| !a.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            let payload = token.split('.').nth(1)?;
+            let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
+            let claims: Value = serde_json::from_slice(&bytes).ok()?;
+            claims["https://api.openai.com/auth"]["chatgpt_account_id"]
+                .as_str()
+                .filter(|a| !a.is_empty())
+                .map(str::to_string)
+        });
+    let Some(account) = account else { return };
+    if !logins.iter().any(|l| l.account == account) {
+        logins.push(CodexLogin {
+            token: token.into(),
+            account,
+            source,
+            expires_ms: entry["expires"].as_i64(),
+        });
+    }
 }
 
 fn codex_windows(body: &Value) -> Vec<Window> {
@@ -592,6 +618,55 @@ mod tests {
             Some(1_792_601_999)
         );
         assert_eq!(parse_time("garbage"), None);
+    }
+
+    #[test]
+    fn pi_and_pig_logins_keep_distinct_accounts_and_deduplicate_shared_ones() {
+        let mut logins = vec![CodexLogin {
+            token: "cli-token".into(),
+            account: "cli-account".into(),
+            source: "codex cli",
+            expires_ms: None,
+        }];
+        let pi = serde_json::json!({
+            "access": "pi-token", "accountId": "pi-account", "expires": 2_000_000_000_000_i64,
+        });
+        add_codex_login(&mut logins, &pi, "pi");
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "https://api.openai.com/auth": {"chatgpt_account_id": "pig-account"}
+            })
+            .to_string(),
+        );
+        let pig = serde_json::json!({
+            "access": format!("header.{payload}.signature"), "expires": 2_000_000_000_001_i64,
+        });
+        add_codex_login(&mut logins, &pig, "pig");
+        assert_eq!(logins.len(), 3);
+        assert_eq!(logins[2].account, "pig-account");
+        assert_eq!(logins[2].source, "pig");
+        assert_eq!(logins[2].expires_ms, Some(2_000_000_000_001));
+        add_codex_login(&mut logins, &pi, "pig");
+        add_codex_login(&mut logins, &pig, "pig");
+        add_codex_login(
+            &mut logins,
+            &serde_json::json!({
+                "access": "duplicate", "accountId": "cli-account"
+            }),
+            "pig",
+        );
+        assert_eq!(logins.len(), 3);
+        assert_eq!(logins[0].token, "cli-token");
+    }
+
+    #[test]
+    fn invalid_pig_credentials_are_skipped() {
+        let mut logins = Vec::new();
+        for token in ["", "not-a-jwt", "h.%%%.s", "h.bm90LWpzb24.s", "h.e30.s"] {
+            add_codex_login(&mut logins, &serde_json::json!({"access": token}), "pig");
+        }
+        add_codex_login(&mut logins, &serde_json::json!({}), "pig");
+        assert!(logins.is_empty());
     }
 
     #[test]

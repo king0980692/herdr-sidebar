@@ -26,6 +26,8 @@ ratatui = "0.30"
 crossterm = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Already in the dependency tree; decode the account ID in PiG's OAuth JWT.
+base64 = "0.22"
 # Column widths for the preview pane's own line wrapping (already in the
 # tree via ratatui; wrapping has to agree with how the terminal measures).
 unicode-width = "0.2"

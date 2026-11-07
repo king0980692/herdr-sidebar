@@ -21,6 +21,15 @@ treats the subdirectory as the plugin root, and each plugin's `herdr-plugin.toml
 `./target/release/<bin>` — a shared workspace would hoist `target/` to the repo root and break
 that path. Keep every crate buildable standalone from its own directory.
 
+## Usage credentials
+
+- Codex usage reads the CLI, pi and PiG logins (`~/.codex/auth.json`,
+  `~/.pi/agent/auth.json`, `~/.pig/agent/auth.json`) and deduplicates by ChatGPT
+  account ID. PiG can omit `accountId`; `usage.rs` then decodes the access JWT's
+  `https://api.openai.com/auth.chatgpt_account_id` claim for the usage request.
+  This is not local authentication; the API validates the token. Never log tokens
+  or refresh another tool's credentials.
+
 ## Build / test / lint
 
 Run from inside the plugin directory, not the repo root:

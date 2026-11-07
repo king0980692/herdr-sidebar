@@ -44,7 +44,11 @@ sample. Disk usage is total minus space available to unprivileged users (so
 reserved blocks count as used). This is the machine running the sidebar, not
 the local laptop when using SSH. Missing metrics show `—`. Percentages align
 on the right, with RAM and disk capacities on separate indented rows. Short
-panes omit headings and then capacity rows before dropping metrics.
+panes omit headings and then capacity rows before dropping metrics. Each metric
+includes a fixed 0–100% sparkline (up to 30 samples, every 10 seconds) where
+space permits; it starts empty and grows from the right. Usage below 70% uses
+the theme accent, 70–89% uses warning, and 90%+ uses alert colors. History stays
+in memory and is reset when leaving Usage; narrow plots show the newest samples.
 
 ### Explorer & Preview
 

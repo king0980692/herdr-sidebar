@@ -3732,7 +3732,12 @@ impl App {
 
     fn draw_usage(&mut self, frame: &mut Frame, area: Rect) {
         let (area, system_area) = usage_sections(area);
-        Self::draw_system_metrics(frame, system_area, self.system_monitor.snapshot);
+        Self::draw_system_metrics(
+            frame,
+            system_area,
+            self.system_monitor.snapshot,
+            &self.system_monitor.history,
+        );
         let width = area.width as usize;
         let mut lines: Vec<Line> = Vec::new();
         let mut headers = std::mem::take(&mut self.usage_headers);
@@ -3818,6 +3823,7 @@ impl App {
         frame: &mut Frame,
         area: Rect,
         snapshot: Option<herdr_sidebar::system_metrics::Snapshot>,
+        history: &[herdr_sidebar::system_metrics::Snapshot],
     ) {
         if area.is_empty() {
             return;
@@ -3835,10 +3841,60 @@ impl App {
                 Style::default().bold().fg(palette().header_accent),
             ));
         }
-        for text in
-            herdr_sidebar::system_metrics::rows(snapshot, usize::from(area.width), area.height >= 5)
+        let details = area.height >= 5;
+        for (index, text) in herdr_sidebar::system_metrics::rows_with_history(
+            snapshot,
+            usize::from(area.width),
+            details,
+            history,
+        )
+        .into_iter()
+        .enumerate()
         {
-            lines.push(Line::raw(text));
+            let summary = index == 0 || index == 1 || index == if details { 3 } else { 2 };
+            if summary && area.width >= 17 {
+                let chars: Vec<char> = text.chars().collect();
+                let current = snapshot.and_then(|sample| match index {
+                    0 => sample.cpu_percent,
+                    1 => sample
+                        .memory
+                        .and_then(|(used, total)| {
+                            herdr_sidebar::system_metrics::percent(used, total)
+                        })
+                        .map(|v| v as f32),
+                    _ => sample
+                        .disk
+                        .and_then(|(used, total)| {
+                            herdr_sidebar::system_metrics::percent(used, total)
+                        })
+                        .map(|v| v as f32),
+                });
+                let color = match current {
+                    Some(v) if v >= 90.0 => palette().conflict,
+                    Some(v) if v >= 70.0 => palette().warning,
+                    _ => palette().accent,
+                };
+                lines.push(Line::from(vec![
+                    Span::raw(chars[..8].iter().collect::<String>()),
+                    Span::styled(
+                        chars[8..chars.len() - 6].iter().collect::<String>(),
+                        Style::default().fg(color),
+                    ),
+                    Span::styled(
+                        chars[chars.len() - 6..].iter().collect::<String>(),
+                        Style::default().fg(color).bold(),
+                    ),
+                ]));
+            } else {
+                lines.push(Line::styled(
+                    text,
+                    if summary {
+                        Style::default()
+                    } else {
+                        Style::default().dim()
+                    },
+                ));
+            }
         }
         frame.render_widget(Paragraph::new(lines), area);
     }
@@ -6123,7 +6179,7 @@ mod tests {
                     .draw(|frame| {
                         let (agents, system) = usage_sections(frame.area());
                         frame.render_widget(Paragraph::new("AGENT"), agents);
-                        App::draw_system_metrics(frame, system, snapshot);
+                        App::draw_system_metrics(frame, system, snapshot, &[]);
                     })
                     .unwrap();
                 let buffer = terminal.backend().buffer();

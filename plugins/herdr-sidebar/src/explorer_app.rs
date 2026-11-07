@@ -216,7 +216,7 @@ enum Overlay {
         rect: Rect,
         scroll: usize,
     },
-    /// The Usage view (`4`): subscription limits of the coding agents. Like
+    /// The Usage view (`1`): subscription limits of the coding agents. Like
     /// Search it replaces the tree rather than floating over it.
     Usage,
     QuickOpen {
@@ -1293,7 +1293,7 @@ impl App {
             return None;
         }
         // View switching from the keyboard, VS Code's activity-bar order:
-        // 1 Explorer, 2 Usage, 3 Source Control, 4 Search. Ctrl+1/2/3 always switch (an
+        // 1 Usage, 2 Explorer, 3 Source Control, 4 Search. Ctrl+1/2/3 always switch (an
         // editor's group-focus chord), so they work even mid-word in a focused
         // search field. Bare 1/2/3 ALSO switch while the Search box is NOT
         // focused (its Results list) — the state you land in when switching to
@@ -1301,8 +1301,9 @@ impl App {
         // box (Ctrl+F / Tab / click); a focused box captures digits as text so
         // "3" is searchable. The tree's own bare 1/2/3 are handled further down.
         let injected_view = match key.code {
-            KeyCode::F(9) => Some('1'),
-            KeyCode::F(10) => Some('2'),
+            // Internal host actions: F9 = Explorer, F10 = Search, F11 = Git.
+            KeyCode::F(9) => Some('2'),
+            KeyCode::F(10) => Some('4'),
             KeyCode::F(11) => Some('3'),
             _ => None,
         };
@@ -1321,7 +1322,7 @@ impl App {
                     self.suspended_search = None;
                 }
                 return match c {
-                    '1' => {
+                    '2' => {
                         // Explorer is this app's own tree: dropping the search
                         // overlay lands on it in-process.
                         if matches!(
@@ -1338,7 +1339,7 @@ impl App {
                         }
                         self.switch_to(View::Explorer)
                     }
-                    '2' => {
+                    '1' => {
                         self.open_usage();
                         None
                     }
@@ -1441,8 +1442,8 @@ impl App {
             KeyCode::Char('c') => self.change_folder_dialog(),
             KeyCode::Char('m') => self.open_menu_for_selection(),
             KeyCode::Char('s') => self.open_settings(),
-            KeyCode::Char('1') => return self.switch_to(View::Explorer),
-            KeyCode::Char('2') => self.open_usage(),
+            KeyCode::Char('1') => self.open_usage(),
+            KeyCode::Char('2') => return self.switch_to(View::Explorer),
             KeyCode::Char('3') => return self.switch_to(View::SourceControl),
             KeyCode::Char('4') => self.open_content_search(false),
             _ => {}
@@ -3657,7 +3658,7 @@ impl App {
         }
     }
 
-    /// `4` / the activity bar: show the Usage view, fetching if what we have
+    /// `1` / the activity bar: show the Usage view, fetching if what we have
     /// is missing or older than [`USAGE_REFRESH`].
     pub fn open_usage(&mut self) {
         if !matches!(self.overlay, Some(Overlay::Usage)) {
@@ -4282,8 +4283,8 @@ impl App {
         ];
         if self.merged() {
             hints.extend([
-                ("1", "files"),
-                ("2", "usage"),
+                ("1", "usage"),
+                ("2", "files"),
                 ("3", "git"),
                 ("4", "search"),
             ]);
@@ -4353,9 +4354,9 @@ impl App {
         };
         let mut spans = [
             Span::raw(" "),
-            Span::raw(format!(" {exp_icon}{slack} ")),
-            Span::raw(" "),
             Span::raw(format!(" {usage_icon}{slack} ")),
+            Span::raw(" "),
+            Span::raw(format!(" {exp_icon}{slack} ")),
             Span::raw(" "),
             Span::raw(format!(" {git_icon}{slack} ")),
             Span::raw(" "),
@@ -4371,30 +4372,30 @@ impl App {
         }
         self.activity = ActivityZones {
             row: area.y,
-            explorer: bounds[1],
+            explorer: bounds[3],
             search: bounds[7],
             source_control: bounds[5],
-            usage: bounds[3],
+            usage: bounds[1],
         };
         let hovered = |bounds| {
             self.mouse_pos
                 .is_some_and(|(x, y)| hits_activity_button(bounds, area.y, x, y))
         };
-        let explorer_hovered = hovered(bounds[1]);
+        let explorer_hovered = hovered(bounds[3]);
         let search_hovered = hovered(bounds[7]);
         let git_hovered = hovered(bounds[5]);
-        let usage_hovered = hovered(bounds[3]);
+        let usage_hovered = hovered(bounds[1]);
         let explorer_active = !search_active && !usage_active;
-        spans[1].style = activity_button_style(explorer_active, explorer_hovered);
+        spans[3].style = activity_button_style(explorer_active, explorer_hovered);
         spans[7].style = activity_button_style(search_active, search_hovered);
         spans[5].style = activity_button_style(false, git_hovered);
-        spans[3].style = activity_button_style(usage_active, usage_hovered);
+        spans[1].style = activity_button_style(usage_active, usage_hovered);
         let (chip_start, chip_end) = if search_active {
             bounds[7]
         } else if usage_active {
-            bounds[3]
-        } else {
             bounds[1]
+        } else {
+            bounds[3]
         };
         draw_activity_caps(
             frame,
@@ -4404,10 +4405,10 @@ impl App {
             palette().selection_bg,
         );
         for (active, is_hovered, button_bounds) in [
-            (explorer_active, explorer_hovered, bounds[1]),
+            (explorer_active, explorer_hovered, bounds[3]),
             (search_active, search_hovered, bounds[7]),
             (false, git_hovered, bounds[5]),
-            (usage_active, usage_hovered, bounds[3]),
+            (usage_active, usage_hovered, bounds[1]),
         ] {
             if !active && is_hovered {
                 draw_activity_caps(

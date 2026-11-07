@@ -33,8 +33,8 @@ source build when needed.
 
 ## Three Views
 
-The activity bar switches Explorer, Search, and Source Control instantly in one process.
-Use the mouse or press `1`, `2`, and `3`.
+The activity bar switches Usage, Explorer, Source Control, and Search instantly in one process.
+Use the mouse or press `1`, `2`, `3`, and `4`, respectively.
 
 ### Explorer & Preview
 
@@ -119,7 +119,7 @@ folder stays put until that pane changes directory again.
 | `m` | context menu | `m` | context menu |
 | `s` | settings | `s` | settings |
 | `b` | hide | `b` | hide |
-| `1` / `2` / `3` | change view | `1` / `2` / `3` | change view |
+| `1` / `2` / `3` / `4` | Usage / Explorer / Git / Search | `1` / `2` / `3` / `4` | change view |
 
 Preview: drag to select (releasing copies, following herdr's `copy_on_select`),
 `Ctrl/Cmd+C` to copy, arrows/PageUp/PageDown or

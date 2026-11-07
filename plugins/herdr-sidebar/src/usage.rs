@@ -1,4 +1,4 @@
-//! Subscription usage behind the Explorer's Usage view (`4`): how much of
+//! Subscription usage behind the Explorer's Usage view (`1`): how much of
 //! each coding-agent plan's rate-limit windows is used, and when each resets.
 //! UI-free; `explorer_app.rs` draws it.
 //!

@@ -30,6 +30,13 @@ that path. Keep every crate buildable standalone from its own directory.
   This is not local authentication; the API validates the token. Never log tokens
   or refresh another tool's credentials.
 
+## Activity-bar shortcuts
+
+The visible order is Usage (1), Explorer (2), Source Control (3), Search (4).
+The internal F9/F10/F11 keys sent by `ensure.rs` are semantic host actions
+(Explorer/Search/Source Control), not positional indexes; keep their mappings
+in both explorer and SCM views aligned with `Target::focus_key`.
+
 ## Build / test / lint
 
 Run from inside the plugin directory, not the repo root:

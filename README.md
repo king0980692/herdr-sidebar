@@ -42,8 +42,9 @@ used/total, and `/` filesystem usage (Linux/macOS). It samples in the background
 every 10 seconds only while Usage is open; CPU is unknown until the second
 sample. Disk usage is total minus space available to unprivileged users (so
 reserved blocks count as used). This is the machine running the sidebar, not
-the local laptop when using SSH. Missing metrics show `—`; narrow panes omit
-capacity figures, and short panes omit the section heading before metrics.
+the local laptop when using SSH. Missing metrics show `—`. Percentages align
+on the right, with RAM and disk capacities on separate indented rows. Short
+panes omit headings and then capacity rows before dropping metrics.
 
 ### Explorer & Preview
 

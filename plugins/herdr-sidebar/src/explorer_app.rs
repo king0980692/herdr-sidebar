@@ -44,10 +44,10 @@ const MY_VIEW: View = View::Explorer;
 const DECO_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
 const TREE_SYNC_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Reserve five bottom rows, but always leave an agent row. Very short
+/// Reserve seven bottom rows, but always leave an agent row. Very short
 /// views omit the separator/title before omitting metrics.
 fn usage_sections(area: Rect) -> (Rect, Rect) {
-    let system_height = area.height.saturating_sub(1).min(5);
+    let system_height = area.height.saturating_sub(1).min(7);
     let agent_height = area.height.saturating_sub(system_height);
     (
         Rect::new(area.x, area.y, area.width, agent_height),
@@ -3823,20 +3823,20 @@ impl App {
             return;
         }
         let mut lines = Vec::new();
-        if area.height >= 5 {
+        if area.height >= 7 {
             lines.push(Line::styled(
                 "─".repeat(usize::from(area.width)),
                 Style::default().dim(),
             ));
         }
-        if area.height >= 4 {
+        if area.height == 4 || area.height >= 6 {
             lines.push(Line::styled(
                 " SYSTEM",
                 Style::default().bold().fg(palette().header_accent),
             ));
         }
         for text in
-            herdr_sidebar::system_metrics::lines_for_width(snapshot, usize::from(area.width))
+            herdr_sidebar::system_metrics::rows(snapshot, usize::from(area.width), area.height >= 5)
         {
             lines.push(Line::raw(text));
         }
@@ -6100,7 +6100,7 @@ mod tests {
             assert_eq!(agents.height + system.height, height);
             assert_eq!(agents.bottom(), system.y);
             assert_eq!(system.bottom(), area.bottom());
-            assert!(system.height <= 5);
+            assert!(system.height <= 7);
             if height > 0 {
                 assert!(agents.height > 0);
             }
@@ -6132,7 +6132,14 @@ mod tests {
                     let bottom: String = (0..width)
                         .map(|x| buffer[(x, height - 1)].symbol())
                         .collect();
-                    assert!(bottom.contains("50%"), "disk stays on the bottom: {bottom}");
+                    if height >= 6 {
+                        assert!(
+                            bottom.contains("GiB"),
+                            "disk capacity stays visible: {bottom}"
+                        );
+                    } else {
+                        assert!(bottom.contains("50%"), "disk stays on the bottom: {bottom}");
+                    }
                 }
             }
         }

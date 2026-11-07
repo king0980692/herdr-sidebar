@@ -172,23 +172,48 @@ pub fn lines(snapshot: Option<Snapshot>) -> [String; 3] {
     ]
 }
 
-/// Try compact units before dropping capacity figures in narrow panes.
-pub fn lines_for_width(snapshot: Option<Snapshot>, width: usize) -> [String; 3] {
-    lines(snapshot).map(|text| {
-        if text.chars().count() <= width {
-            return text;
-        }
-        let mut parts = text.split("  ");
-        let label = parts.next().unwrap_or_default();
-        let percent = parts.next().unwrap_or_default();
-        let capacity = parts.next().unwrap_or_default().replace(' ', "");
-        let compact = format!("{label} {percent} {capacity}");
-        if compact.chars().count() <= width {
-            compact
-        } else {
-            format!("{label} {percent}")
-        }
-    })
+/// Aligned percentages with separate capacity rows. Leave one cell on each
+/// side so values do not run into the pane divider or terminal chrome.
+pub fn rows(snapshot: Option<Snapshot>, width: usize, details: bool) -> Vec<String> {
+    let snapshot = snapshot.unwrap_or_default();
+    let percent_text = |value: Option<(u64, u64)>| {
+        value
+            .and_then(|(used, total)| percent(used, total))
+            .map_or_else(|| "—".to_owned(), |value| format!("{value}%"))
+    };
+    let summary = |label: &str, value: String| {
+        let pad = width
+            .saturating_sub(label.len() + value.chars().count() + 2)
+            .max(1);
+        format!(" {label}{}{value} ", " ".repeat(pad))
+            .chars()
+            .take(width)
+            .collect::<String>()
+    };
+    let capacity_row = |value: Option<(u64, u64)>| {
+        let text = value.filter(|(_, total)| *total > 0).map_or_else(
+            || "  —".to_owned(),
+            |(used, total)| format!("  {} / {}", capacity(used), capacity(total)),
+        );
+        text.chars()
+            .take(width.saturating_sub(1))
+            .collect::<String>()
+    };
+    let mut rows = vec![summary(
+        "CPU",
+        snapshot
+            .cpu_percent
+            .map_or_else(|| "—".to_owned(), |value| format!("{value:.0}%")),
+    )];
+    rows.push(summary("RAM", percent_text(snapshot.memory)));
+    if details {
+        rows.push(capacity_row(snapshot.memory));
+    }
+    rows.push(summary("Disk /", percent_text(snapshot.disk)));
+    if details {
+        rows.push(capacity_row(snapshot.disk));
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -196,22 +221,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn disk_capacity_survives_a_36_column_sidebar() {
+    fn capacities_have_separate_rows_and_percentages_align() {
         let gib = 1024_u64.pow(3);
         let snapshot = Some(Snapshot {
             disk: Some((839 * gib, 1007 * gib)),
             ..Snapshot::default()
         });
-        // A 36-column pane can have only 35 content columns after chrome.
-        let text = lines_for_width(snapshot, 35);
-        assert_eq!(text[2], " Disk / 83% 839.0GiB/1007.0GiB");
-        assert!(text[2].chars().count() <= 35);
-        assert!(lines_for_width(snapshot, 36)[2].contains("1007.0"));
-        assert_eq!(
-            lines_for_width(snapshot, 80)[2],
-            " Disk /  83%  839.0 GiB / 1007.0 GiB"
-        );
-        assert_eq!(lines_for_width(snapshot, 12)[2], " Disk / 83%");
+        for width in [32, 35, 36, 80] {
+            let text = rows(snapshot, width, true);
+            assert_eq!(text.len(), 5);
+            assert!(text[3].ends_with("83% "));
+            assert_eq!(text[4], "  839.0 GiB / 1007.0 GiB");
+            for index in [0, 1, 3] {
+                assert_eq!(text[index].chars().count(), width);
+            }
+            assert!(text.iter().all(|line| line.chars().count() <= width));
+        }
+        let compact = rows(snapshot, 12, false);
+        assert_eq!(compact.len(), 3);
+        assert!(compact[2].ends_with("83% "));
     }
 
     #[test]

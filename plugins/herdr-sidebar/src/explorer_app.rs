@@ -3835,13 +3835,9 @@ impl App {
                 Style::default().bold().fg(palette().header_accent),
             ));
         }
-        for text in herdr_sidebar::system_metrics::lines(snapshot) {
-            // Keep the label and percentage rather than clipping capacity text.
-            let text = if text.chars().count() > usize::from(area.width) {
-                text.split("  ").take(2).collect::<Vec<_>>().join("  ")
-            } else {
-                text
-            };
+        for text in
+            herdr_sidebar::system_metrics::lines_for_width(snapshot, usize::from(area.width))
+        {
             lines.push(Line::raw(text));
         }
         frame.render_widget(Paragraph::new(lines), area);

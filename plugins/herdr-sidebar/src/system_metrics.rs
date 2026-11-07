@@ -172,9 +172,47 @@ pub fn lines(snapshot: Option<Snapshot>) -> [String; 3] {
     ]
 }
 
+/// Try compact units before dropping capacity figures in narrow panes.
+pub fn lines_for_width(snapshot: Option<Snapshot>, width: usize) -> [String; 3] {
+    lines(snapshot).map(|text| {
+        if text.chars().count() <= width {
+            return text;
+        }
+        let mut parts = text.split("  ");
+        let label = parts.next().unwrap_or_default();
+        let percent = parts.next().unwrap_or_default();
+        let capacity = parts.next().unwrap_or_default().replace(' ', "");
+        let compact = format!("{label} {percent} {capacity}");
+        if compact.chars().count() <= width {
+            compact
+        } else {
+            format!("{label} {percent}")
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disk_capacity_survives_a_36_column_sidebar() {
+        let gib = 1024_u64.pow(3);
+        let snapshot = Some(Snapshot {
+            disk: Some((839 * gib, 1007 * gib)),
+            ..Snapshot::default()
+        });
+        // A 36-column pane can have only 35 content columns after chrome.
+        let text = lines_for_width(snapshot, 35);
+        assert_eq!(text[2], " Disk / 83% 839.0GiB/1007.0GiB");
+        assert!(text[2].chars().count() <= 35);
+        assert!(lines_for_width(snapshot, 36)[2].contains("1007.0"));
+        assert_eq!(
+            lines_for_width(snapshot, 80)[2],
+            " Disk /  83%  839.0 GiB / 1007.0 GiB"
+        );
+        assert_eq!(lines_for_width(snapshot, 12)[2], " Disk / 83%");
+    }
 
     #[test]
     fn percentages_and_capacity_are_safe() {

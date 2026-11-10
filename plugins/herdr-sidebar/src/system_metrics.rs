@@ -88,8 +88,6 @@ pub struct Monitor {
     receiver: Option<Receiver<(Sampler, Snapshot)>>,
     last_started: Option<Instant>,
     pub snapshot: Option<Snapshot>,
-    /// At most five minutes, recorded only when a fresh sample arrives.
-    pub history: Vec<Snapshot>,
 }
 
 impl Monitor {
@@ -117,10 +115,6 @@ impl Monitor {
                 Ok((sampler, snapshot)) => {
                     self.sampler = Some(sampler);
                     self.snapshot = Some(snapshot);
-                    if self.history.len() == 30 {
-                        self.history.remove(0);
-                    }
-                    self.history.push(snapshot);
                     self.receiver = None;
                 }
                 Err(TryRecvError::Disconnected) => self.receiver = None,
@@ -222,34 +216,19 @@ pub fn rows(snapshot: Option<Snapshot>, width: usize, details: bool) -> Vec<Stri
     rows
 }
 
-/// Fixed-scale 0..100% sparkline, newest sample on the right. Empty history
-/// is blank rather than fabricated; unavailable samples use a middle dot.
-fn sparkline(values: impl Iterator<Item = Option<f32>>, width: usize) -> String {
-    let values: Vec<_> = values.collect();
-    let mut text = " ".repeat(width.saturating_sub(values.len()));
-    const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    for value in values
-        .into_iter()
-        .rev()
-        .take(width)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-    {
-        text.push(match value.filter(|v| v.is_finite()) {
-            Some(value) => LEVELS[((value.clamp(0.0, 100.0) / 100.0) * 7.0).round() as usize],
-            None => '·',
-        });
+/// Current utilization, not a history plot. Unknown data is visibly distinct
+/// from a known zero-percent empty bar.
+fn progress_bar(value: Option<f32>, width: usize) -> String {
+    match value.filter(|v| v.is_finite()) {
+        Some(value) => {
+            let filled = ((value.clamp(0.0, 100.0) / 100.0) * width as f32).round() as usize;
+            format!("{}{}", "━".repeat(filled), "─".repeat(width - filled))
+        }
+        None => "·".repeat(width),
     }
-    text
 }
 
-pub fn rows_with_history(
-    snapshot: Option<Snapshot>,
-    width: usize,
-    details: bool,
-    history: &[Snapshot],
-) -> Vec<String> {
+pub fn rows_with_bars(snapshot: Option<Snapshot>, width: usize, details: bool) -> Vec<String> {
     let mut text = rows(snapshot, width, details);
     if width < 17 {
         return text;
@@ -260,24 +239,12 @@ pub fn rows_with_history(
             .and_then(|(used, total)| percent(used, total))
             .map(|v| v as f32)
     };
-    for (index, label, current, metric) in [
-        (0, "CPU", snapshot.cpu_percent, 0),
-        (1, "RAM", ratio(snapshot.memory), 1),
-        (
-            if details { 3 } else { 2 },
-            "Disk /",
-            ratio(snapshot.disk),
-            2,
-        ),
+    for (index, label, current) in [
+        (0, "CPU", snapshot.cpu_percent),
+        (1, "RAM", ratio(snapshot.memory)),
+        (if details { 3 } else { 2 }, "Disk /", ratio(snapshot.disk)),
     ] {
-        let plot = sparkline(
-            history.iter().map(|sample| match metric {
-                0 => sample.cpu_percent,
-                1 => ratio(sample.memory),
-                _ => ratio(sample.disk),
-            }),
-            width - 14,
-        );
+        let plot = progress_bar(current, width - 14);
         let value = current.map_or_else(|| "—".to_owned(), |v| format!("{v:.0}%"));
         text[index] = format!(" {label:<6} {plot} {value:>4} ");
     }
@@ -311,26 +278,27 @@ mod tests {
     }
 
     #[test]
-    fn sparklines_are_fixed_scale_bounded_and_show_gaps() {
-        assert_eq!(
-            sparkline([Some(0.0), Some(50.0), Some(100.0), None].into_iter(), 4),
-            "▁▅█·"
-        );
-        assert_eq!(sparkline([Some(100.0)].into_iter(), 4), "   █");
-        assert_eq!(sparkline([Some(0.0), Some(100.0)].into_iter(), 1), "█");
+    fn progress_bars_show_current_values_without_history() {
+        assert_eq!(progress_bar(Some(0.0), 4), "────");
+        assert_eq!(progress_bar(Some(50.0), 4), "━━──");
+        assert_eq!(progress_bar(Some(100.0), 4), "━━━━");
+        assert_eq!(progress_bar(Some(120.0), 4), "━━━━");
+        assert_eq!(progress_bar(None, 4), "····");
+        assert_eq!(progress_bar(Some(f32::NAN), 4), "····");
+        assert_eq!(progress_bar(Some(50.0), 0), "");
         let snapshot = Snapshot {
             cpu_percent: Some(50.0),
             disk: Some((3, 4)),
             ..Snapshot::default()
         };
         for width in [1, 12, 17, 35, 36, 80] {
-            let text = rows_with_history(Some(snapshot), width, true, &[snapshot]);
+            let text = rows_with_bars(Some(snapshot), width, true);
             assert!(text.iter().all(|line| line.chars().count() <= width));
             if width >= 17 {
-                assert!(text[0].contains('▅'));
+                assert!(text[0].contains('━'));
             }
         }
-        assert_eq!(rows_with_history(None, 12, true, &[]), rows(None, 12, true));
+        assert_eq!(rows_with_bars(None, 12, true), rows(None, 12, true));
     }
 
     #[test]
@@ -374,11 +342,9 @@ mod tests {
         });
         monitor.tick_with(true, now + REFRESH, |_, _| panic!("duplicate sample"));
         assert_eq!(monitor.snapshot, Some(second));
-        assert_eq!(monitor.history, vec![first, second]);
         monitor.tick_with(false, now + REFRESH, |_, _| panic!("hidden"));
         assert!(monitor.receiver.is_none());
         assert!(monitor.snapshot.is_none());
-        assert!(monitor.history.is_empty());
         monitor.tick_with(false, now + REFRESH * 2, |_, _| panic!("hidden"));
     }
 

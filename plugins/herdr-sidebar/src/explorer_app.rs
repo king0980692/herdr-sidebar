@@ -3732,12 +3732,7 @@ impl App {
 
     fn draw_usage(&mut self, frame: &mut Frame, area: Rect) {
         let (area, system_area) = usage_sections(area);
-        Self::draw_system_metrics(
-            frame,
-            system_area,
-            self.system_monitor.snapshot,
-            &self.system_monitor.history,
-        );
+        Self::draw_system_metrics(frame, system_area, self.system_monitor.snapshot);
         let width = area.width as usize;
         let mut lines: Vec<Line> = Vec::new();
         let mut headers = std::mem::take(&mut self.usage_headers);
@@ -3823,7 +3818,6 @@ impl App {
         frame: &mut Frame,
         area: Rect,
         snapshot: Option<herdr_sidebar::system_metrics::Snapshot>,
-        history: &[herdr_sidebar::system_metrics::Snapshot],
     ) {
         if area.is_empty() {
             return;
@@ -3842,11 +3836,10 @@ impl App {
             ));
         }
         let details = area.height >= 5;
-        for (index, text) in herdr_sidebar::system_metrics::rows_with_history(
+        for (index, text) in herdr_sidebar::system_metrics::rows_with_bars(
             snapshot,
             usize::from(area.width),
             details,
-            history,
         )
         .into_iter()
         .enumerate()
@@ -6179,7 +6172,7 @@ mod tests {
                     .draw(|frame| {
                         let (agents, system) = usage_sections(frame.area());
                         frame.render_widget(Paragraph::new("AGENT"), agents);
-                        App::draw_system_metrics(frame, system, snapshot, &[]);
+                        App::draw_system_metrics(frame, system, snapshot);
                     })
                     .unwrap();
                 let buffer = terminal.backend().buffer();

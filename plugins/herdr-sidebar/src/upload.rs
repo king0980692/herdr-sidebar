@@ -105,7 +105,10 @@ fn respond(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         body.len()
     )?;
-    stream.write_all(body)
+    stream.write_all(body)?;
+    // Send an orderly end-of-response before dropping the socket. In
+    // particular, Winsock can otherwise reset a connection after a response.
+    stream.shutdown(std::net::Shutdown::Write)
 }
 
 fn handle(
@@ -361,7 +364,15 @@ mod tests {
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         s.write_all(raw).unwrap();
         let mut out = Vec::new();
-        s.read_to_end(&mut out).unwrap();
+        s.read_to_end(&mut out).unwrap_or_else(|error| {
+            panic!(
+                "response read failed for {}: {error}; received {} bytes",
+                String::from_utf8_lossy(
+                    raw.split(|byte| *byte == b'\n').next().unwrap_or_default()
+                ),
+                out.len()
+            )
+        });
         String::from_utf8_lossy(&out).into_owned()
     }
 

@@ -656,6 +656,7 @@ version = "0.16.1"
 dependencies = [
  "base64",
  "crossterm",
+ "getrandom 0.3.4",
  "globset",
  "ignore",
  "image",

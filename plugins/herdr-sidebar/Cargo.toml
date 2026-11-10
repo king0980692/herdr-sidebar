@@ -26,6 +26,8 @@ ratatui = "0.30"
 crossterm = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# OS-backed secure tokens on Unix and Windows (already a transitive dependency).
+getrandom = { version = "0.3", features = ["std"] }
 # Cross-platform CPU and memory metrics for the Usage view (MSRV 1.88).
 sysinfo = { version = "0.37", default-features = false, features = ["system"] }
 # Already in the dependency tree; decode the account ID in PiG's OAuth JWT.

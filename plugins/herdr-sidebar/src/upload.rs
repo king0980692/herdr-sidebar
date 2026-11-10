@@ -405,7 +405,9 @@ mod tests {
         assert!(request(port, b"GET /nope/ HTTP/1.1\r\n\r\n").starts_with("HTTP/1.1 404"));
 
         let big = vec![7u8; 300_000];
-        assert!(put(port, "/tok/f/%E5%A0%B1%E5%91%8A.bin", &big).contains("\"name\":\"報告.bin\""));
+        let response = put(port, "/tok/f/%E5%A0%B1%E5%91%8A.bin", &big);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("\"name\":\"報告.bin\""), "{response}");
         assert_eq!(std::fs::read(dir.join("報告.bin")).unwrap(), big);
         // An existing name is kept; the upload gets a free one.
         assert!(put(port, "/tok/f/a.txt", b"new").contains("a copy.txt"));

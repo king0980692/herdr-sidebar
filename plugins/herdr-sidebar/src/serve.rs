@@ -249,7 +249,7 @@ pub(crate) fn token_matches(target: &str, token: &str) -> bool {
 
 pub(crate) fn random_token() -> io::Result<String> {
     let mut bytes = [0u8; 16];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    getrandom::fill(&mut bytes).map_err(io::Error::other)?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
@@ -294,6 +294,15 @@ mod tests {
         let mut out = Vec::new();
         s.read_to_end(&mut out).unwrap();
         out
+    }
+
+    #[test]
+    fn secure_tokens_are_128_bit_hex_on_every_platform() {
+        let first = random_token().unwrap();
+        let second = random_token().unwrap();
+        assert_eq!(first.len(), 32);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second);
     }
 
     #[test]

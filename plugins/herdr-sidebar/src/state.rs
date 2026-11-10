@@ -642,20 +642,19 @@ fn write_state(path: &Path, state: State) {
     let Some(settings_path) = settings_path() else {
         return;
     };
-    if let Some(dir) = settings_path.parent() {
-        if std::fs::create_dir_all(dir).is_err() {
-            return;
-        }
+    if let Some(dir) = settings_path.parent()
+        && std::fs::create_dir_all(dir).is_err()
+    {
+        return;
     }
     // Do not destroy a malformed settings file the user may need to recover.
-    if let Ok(existing) = std::fs::read_to_string(&settings_path) {
-        if serde_json::from_str::<serde_json::Value>(&existing)
+    if let Ok(existing) = std::fs::read_to_string(&settings_path)
+        && serde_json::from_str::<serde_json::Value>(&existing)
             .ok()
             .and_then(|v| v.as_object().cloned())
             .is_none()
-        {
-            return;
-        }
+    {
+        return;
     }
     let Ok(settings) = serde_json::to_string_pretty(&value) else {
         return;

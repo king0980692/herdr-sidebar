@@ -149,6 +149,24 @@ type = "shell"
 command = "herdr plugin action invoke quick-open --plugin herdr-sidebar"
 ```
 
+## Fork releases and CI
+
+This fork's active branch is `leon`. CI runs on pushes to `leon` and `main`,
+PRs, and manual runs. It builds, tests, formats and lints on Linux x64/ARM64,
+macOS Intel/Apple Silicon, and Windows x64. Fork Actions must be enabled.
+
+Version tags (`v*`) run the same CI before building release assets. Each asset
+is `herdr-sidebar-<Rust target triple>.tar.gz`, containing `bin/herdr-sidebar`
+and `bin/herdr-sidebar-ensure` (with `.exe` on Windows), plus the license.
+`SHA256SUMS` covers every archive. Release publishing waits for every platform.
+
+For the dotfiles-managed setup, use the pinned `github:king0980692/herdr-sidebar`
+entry in mise and the local registration manifest from the dotfiles repository.
+This downloads prebuilt archives without Cargo. It does not install or update
+through Herdr's upstream plugin installer. To release a new version, update
+Cargo.toml, Cargo.lock and herdr-plugin.toml consistently, pass CI, then push
+the matching version tag. Only update the dotfiles version after assets publish.
+
 ## Install & Develop
 
 **Requirements:** herdr 0.8+. Source builds require Rust 1.89+.

@@ -8,7 +8,11 @@ permissions:
   contents: read
 
 jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
   build:
+    needs: checks
     name: build ${{ matrix.triple }}
     strategy:
       fail-fast: false
@@ -20,7 +24,7 @@ jobs:
             triple: x86_64-unknown-linux-musl
           - os: ubuntu-24.04-arm
             triple: aarch64-unknown-linux-musl
-          - os: macos-latest
+          - os: macos-15-intel
             triple: x86_64-apple-darwin
           - os: macos-latest
             triple: aarch64-apple-darwin
@@ -46,8 +50,12 @@ jobs:
       - name: Install musl linker
         if: endsWith(matrix.triple, '-unknown-linux-musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: plugins/herdr-sidebar
+          key: release-${{ matrix.triple }}
       - name: Build release binaries
-        run: cargo build --release --target ${{ matrix.triple }} --bins
+        run: cargo build --locked --release --target ${{ matrix.triple }} --bins
       - name: Stage assets and checksums
         shell: bash
         run: |
@@ -56,12 +64,13 @@ jobs:
           triple="${{ matrix.triple }}"
           suffix=""
           if [[ "$triple" == *windows* ]]; then suffix=".exe"; fi
-          cp "target/$triple/release/herdr-sidebar$suffix" "dist/herdr-sidebar-$triple$suffix"
-          if [[ "$triple" == *windows* ]]; then
-            cp "target/$triple/release/herdr-sidebar-ensure.exe" "dist/herdr-sidebar-ensure-$triple.exe"
-          fi
+          mkdir -p package/bin
+          cp "target/$triple/release/herdr-sidebar$suffix" "package/bin/herdr-sidebar$suffix"
+          cp "target/$triple/release/herdr-sidebar-ensure$suffix" "package/bin/herdr-sidebar-ensure$suffix"
+          cp ../../LICENSE package/LICENSE
+          tar -czf "dist/herdr-sidebar-$triple.tar.gz" -C package .
           cd dist
-          for file in herdr-sidebar-*; do
+          for file in *.tar.gz; do
             if command -v sha256sum >/dev/null 2>&1; then sha256sum "$file"; else shasum -a 256 "$file"; fi
           done > CHECKSUMS.part
       - uses: actions/upload-artifact@v7
@@ -84,6 +93,8 @@ jobs:
           mkdir release
           find artifacts -type f ! -name 'CHECKSUMS.part' -exec cp {} release/ \;
           cat artifacts/*/CHECKSUMS.part > release/SHA256SUMS
+      - name: Verify staged checksums
+        run: cd release && sha256sum --check SHA256SUMS
       - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

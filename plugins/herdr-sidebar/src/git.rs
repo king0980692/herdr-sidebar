@@ -861,6 +861,14 @@ impl IgnoredScanLock {
     }
 }
 
+impl Drop for IgnoredScanLock {
+    fn drop(&mut self) {
+        // Another thread can fork while this file is open. Explicitly unlock
+        // rather than waiting for a child's inherited descriptor to close.
+        let _ = self._file.unlock();
+    }
+}
+
 fn open_ignored_scan_lock(path: &Path) -> Result<File, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("ignored-file scan lock: {e}"))?;

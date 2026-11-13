@@ -258,3 +258,13 @@ command = ["./target/release/herdr-sidebar", "--autoclose"]
 on = "tab.focused"
 platforms = ["windows"]
 command = [".\\target\\release\\herdr-sidebar-ensure.exe"]
+
+# herdr-native: on a remote machine (a shared hc machine), herdr-native copies
+# this plugin there and installs this fork's release binary for that machine,
+# checked against SHA256SUMS, where the panes above expect it. Neither mise,
+# Rust nor a manual install is needed there. Other hosts ignore this table.
+[remote]
+archive = "https://github.com/king0980692/herdr-sidebar/releases/download/v{version}/herdr-sidebar-{target}.tar.gz"
+sha256sums = "https://github.com/king0980692/herdr-sidebar/releases/download/v{version}/SHA256SUMS"
+binary = "bin/herdr-sidebar"
+install_as = "target/release/herdr-sidebar"

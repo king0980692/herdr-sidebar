@@ -628,8 +628,8 @@ impl Editor {
             char_len(&self.lines[start.line]),
         );
         out.push('\n');
-        for line in start.line + 1..end.line {
-            out.push_str(&self.lines[line]);
+        for line in self.lines.iter().take(end.line).skip(start.line + 1) {
+            out.push_str(line);
             out.push('\n');
         }
         out.push_str(&char_slice(&self.lines[end.line], 0, end.col));

@@ -2,8 +2,12 @@
 //! each coding-agent plan's rate-limit windows is used, and when each resets.
 //! UI-free; `explorer_app.rs` draws it.
 //!
-//! Sources, each with the credentials its own CLI already keeps (a provider
-//! without credentials is simply left out):
+//! Default source: the running loopback Magpie gateway (`crate::magpie`).
+//! Native credentials are read ONLY with explicit `usage_source: "native"`.
+//! Invalid settings return a Magpie error, never a native fallback.
+//!
+//! Legacy native sources, each with the credentials its own CLI already keeps
+//! (a provider without credentials is simply left out):
 //! - Claude: `~/.claude/.credentials.json` (on macOS the same JSON lives in the
 //!   login Keychain as "Claude Code-credentials") →
 //!   `api.anthropic.com/api/oauth/usage`
@@ -55,6 +59,11 @@ pub struct Provider {
 /// Every configured provider, fetched now. Slow (network): run it off the
 /// UI thread.
 pub fn fetch_all() -> Vec<Provider> {
+    match crate::magpie::load_config() {
+        Ok(config) if config.usage_source == crate::magpie::Source::Native => {}
+        Ok(config) => return crate::magpie::fetch(&config),
+        Err(error) => return vec![crate::magpie::unavailable(&error)],
+    }
     let mut all: Vec<Provider> = claude().into_iter().collect();
     all.extend(codex());
     all.extend(opencode_go());
@@ -116,23 +125,66 @@ fn get(url: &str, headers: &[String]) -> Result<Value, String> {
     serde_json::from_slice(&out.stdout).map_err(|_| "unexpected answer".into())
 }
 
-/// ISO-8601 UTC (`2026-11-04T12:56:31.000Z`, `+00:00`) → unix seconds.
-fn parse_time(s: &str) -> Option<i64> {
+/// Strict RFC3339 → Unix seconds, including fractional seconds and UTC offsets.
+pub(crate) fn parse_time(s: &str) -> Option<i64> {
     let s = s.trim();
-    let (date, time) = s.split_once('T')?;
-    let mut d = date.split('-').map(|p| p.parse::<i64>().ok());
-    let (y, m, day) = (d.next()??, d.next()??, d.next()??);
-    let time: String = time.chars().take(8).collect();
-    let mut t = time.split(':').map(|p| p.parse::<i64>().ok());
-    let (hh, mm, ss) = (t.next()??, t.next()??, t.next()??);
-    // Days from the civil date (Howard Hinnant's algorithm).
-    let y = if m <= 2 { y - 1 } else { y };
+    if !s.is_ascii() || s.len() < 20 {
+        return None;
+    }
+    let b = s.as_bytes();
+    if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let number = |a, z| {
+        let field = s.get(a..z)?;
+        field.bytes().all(|b| b.is_ascii_digit()).then_some(())?;
+        field.parse::<i64>().ok()
+    };
+    let (year, month, day) = (number(0, 4)?, number(5, 7)?, number(8, 10)?);
+    let (hour, minute, second) = (number(11, 13)?, number(14, 16)?, number(17, 19)?);
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if !(1..=days_in_month).contains(&day) || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let mut pos = 19;
+    if b.get(pos) == Some(&b'.') {
+        pos += 1;
+        let start = pos;
+        while b.get(pos).is_some_and(u8::is_ascii_digit) {
+            pos += 1;
+        }
+        if pos == start {
+            return None;
+        }
+    }
+    let offset = match s.get(pos..)? {
+        "Z" => 0,
+        zone if zone.len() == 6
+            && matches!(zone.as_bytes()[0], b'+' | b'-')
+            && zone.as_bytes()[3] == b':' =>
+        {
+            let h = number(pos + 1, pos + 3)?;
+            let m = number(pos + 4, pos + 6)?;
+            if h > 23 || m > 59 {
+                return None;
+            }
+            (h * 3600 + m * 60) * if zone.starts_with('-') { -1 } else { 1 }
+        }
+        _ => return None,
+    };
+    let y = if month <= 2 { year - 1 } else { year };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
-    let doy = (153 * ((m + 9) % 12) + 2) / 5 + day - 1;
+    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    Some(days * 86_400 + hh * 3600 + mm * 60 + ss)
+    Some((era * 146_097 + doe - 719_468) * 86_400 + hour * 3600 + minute * 60 + second - offset)
 }
 
 fn window_name(secs: i64) -> String {
@@ -618,6 +670,22 @@ mod tests {
             Some(1_792_601_999)
         );
         assert_eq!(parse_time("garbage"), None);
+        assert_eq!(parse_time("1970-01-01T08:00:00.123456+08:00"), Some(0));
+        assert_eq!(parse_time("1969-12-31T19:00:00.9-05:00"), Some(0));
+        assert_eq!(parse_time("1970-01-01T00:00:00+00:30"), Some(-1800));
+        for invalid in [
+            "2026-02-29T00:00:00Z",
+            "2024-02-30T00:00:00Z",
+            "1970-00-01T00:00:00Z",
+            "1970-01-01T24:00:00Z",
+            "1970-01-01T00:00:00+00:-1",
+            "1970-01-01T-1:00:00Z",
+            "1970-01-01T00:00:00.Z",
+            "1970-01-01T00:00:00Zjunk",
+            "1970-01-01T00:00:00",
+        ] {
+            assert_eq!(parse_time(invalid), None, "{invalid}");
+        }
     }
 
     #[test]

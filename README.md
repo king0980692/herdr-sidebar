@@ -50,6 +50,92 @@ space permits; no historical samples are retained. Usage below 70% uses the
 theme accent, 70–89% uses warning, and 90%+ uses alert colors. Unknown values
 use dotted bars rather than appearing as zero usage.
 
+### Same mise release on Mac and Linux
+
+With mise already installed, from this checkout run:
+
+```sh
+sh plugins/herdr-sidebar/scripts/install-mise.sh 0.16.3
+```
+
+The installer pins only `github:king0980692/herdr-sidebar` globally and selects
+the matching release archive for Apple Silicon/Intel Mac or ARM64/x86_64 Linux.
+It does not install unrelated tools, enable project trust/hooks, change login
+accounts, or restart panes. `--dry-run` previews the mise operation. The matching
+release must be published first; this installer deliberately allows the requested
+new release without a minimum-age delay. Existing pinned versions remain installed
+for rollback. Configure existing plugin `run.sh` launchers to resolve this tool
+with `mise where`, not to install tools during every focus event.
+
+Mise installs the **program**, not account credentials or live quota connectivity.
+For a shared Mac Magpie, an independently authorized quota-only loopback relay
+and SSH channel can provide `GET /v1/magpie/quotas` on remote loopback port 3426;
+set remote `magpie_url` to `http://127.0.0.1:3426`. Never expose the entire model
+API merely to draw a quota card. The sidebar itself creates no tunnel.
+
+### Magpie account quotas
+
+Usage now reads the **already running Magpie gateway**, not Claude/Codex login files.
+Configure the portable sidebar preferences at
+`~/.config/herdr-sidebar/settings.json` (`$XDG_CONFIG_HOME` is respected):
+
+```json
+{
+  "usage_source": "magpie",
+  "magpie_url": "http://127.0.0.1:3425"
+}
+```
+
+Merge these keys into your existing settings; do not replace your other preferences.
+Magpie is the default source. `magpie_url` must be an HTTP loopback address; this
+integration does not enable LAN sharing or store a gateway key. If Magpie uses a
+custom port, set that port here. On a remote machine, loopback means **that remote
+machine**: it needs its own running Magpie gateway or a separately arranged local
+forward. The sidebar does not start Magpie, create a daemon, or open a tunnel.
+
+Each account remains a separate section, including same-email Personal/Team
+workspaces. The compact view shows its short alias, plan badge, and two-line
+quota windows (usage + reset countdown, then a thin bar). Service headers show
+account counts, not a misleading single worst-account percentage. Repeated email
+addresses and long ISO timestamps are kept out of the TUI; `--usage` retains the
+full identity and source timestamp for diagnostics. Freshness is shown as
+`Magpie · updated HH:MM`, with explicit stale/error warnings. Unknown image quotas
+are omitted when numeric subscription windows are available; an entirely unknown
+account remains explicitly unknown, never a fake 0%-used gauge. Percentages are
+**used**, not remaining.
+
+Multiple panes share a private per-user snapshot and crash-released refresh lock;
+requests have bounded time/size and a cache interval. This is a shared data fetch,
+not a replacement for Herdr's pane lifecycle or a new always-on sidebar service.
+Only `GET /v1/magpie/quotas` is requested: no model calls, account switching, token
+refresh command, reset spending, paid-credit policy change or credential export.
+The gateway itself owns its normal account/quota refresh behavior.
+
+If Magpie is unavailable, Usage reports that; it does **not** silently fall back
+to reading other tools' credentials. For the previous direct-provider behavior,
+explicitly set `"usage_source": "native"`. Native mode reads existing Claude,
+Codex/pi/PiG and OpenCode login sources as before. File-only backend settings
+survive settings changes made in the new sidebar UI.
+
+For build-only verification without overwriting an installed binary:
+
+```sh
+cd plugins/herdr-sidebar
+cargo test --locked --target-dir target/magpie-review
+cargo clippy --locked --target-dir target/magpie-review --all-targets -- -D warnings
+cargo build --release --locked --target-dir target/magpie-review
+# Fake local gateway: HTTP contract, cross-process cache, error/redirect behavior.
+python3 scripts/test-magpie-gateway.py target/magpie-review/release/herdr-sidebar
+# Read-only live gateway smoke test (not an offline test):
+./target/magpie-review/release/herdr-sidebar --usage
+```
+
+Building this checkout does not update a mise-installed release or the launchers
+under `~/.config/herdr/plugins/` / `~/.config/herdr-native/plugins/`. Deployment
+must explicitly point those launchers at the new build or install a release
+containing it. Do not overwrite a mise-managed `0.16.2` binary in place, and do not
+restart live panes just to compile. Old running panes keep their old code.
+
 ### Explorer & Preview
 
 <div align="center">

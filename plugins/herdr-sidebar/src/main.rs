@@ -62,6 +62,9 @@ fn main() -> std::io::Result<()> {
                 if let Some(err) = provider.error {
                     println!("  ! {err}");
                 }
+                if let Some(note) = provider.note {
+                    println!("  {note}");
+                }
                 for w in provider.windows {
                     println!(
                         "  {:<16} {:>5.1}%  resets_at={:?}  limited={}",

@@ -5819,8 +5819,9 @@ fn usage_bar(used: f64, cells: usize, color: Color, pace: Option<f64>) -> Vec<Sp
     let full = (exact.floor() as usize).min(cells);
     // A half-cell cap for the fraction keeps small steps visible.
     let half = exact - full as f64 >= 0.5 && full < cells;
-    let pace_cell =
-        pace.map(|p| (((p.clamp(0.0, 100.0) / 100.0) * cells as f64) as usize).min(cells - 1));
+    let pace_cell = pace
+        .filter(|_| cells > 0)
+        .map(|p| (((p.clamp(0.0, 100.0) / 100.0) * cells as f64) as usize).min(cells - 1));
     (0..cells)
         .map(|cell| {
             if Some(cell) == pace_cell {
@@ -5836,11 +5837,81 @@ fn usage_bar(used: f64, cells: usize, color: Color, pace: Option<f64>) -> Vec<Sp
         .collect()
 }
 
-/// One service's card — several accounts of it (e.g. Codex through the CLI
-/// and through pi) share one: a header band (name, plan badge when there is
-/// one account, highest usage of all), then per account its plan and email,
-/// then per window its label and percentage, a thin bar with the pace
-/// marker, and when it resets and how it compares with an even pace.
+/// Display aliases without leaking the raw identity into every card. The original
+/// account string remains untouched in Provider (and in --usage evidence).
+fn usage_account_name(account: Option<&str>) -> String {
+    let Some(account) = account.filter(|s| !s.trim().is_empty()) else {
+        return "Account".into();
+    };
+    let parts: Vec<_> = account.split(" · ").map(str::trim).collect();
+    if let Some(email) = parts.iter().position(|part| part.contains('@')) {
+        if email > 0 {
+            return parts[..email].join(" · ");
+        }
+        return parts[0].into();
+    }
+    account.trim().into()
+}
+
+fn usage_plan_name(plan: &str, service: &str) -> String {
+    let plan = plan.trim();
+    let plan = plan.strip_prefix(service).unwrap_or(plan).trim();
+    let plan = plan.strip_prefix("ChatGPT ").unwrap_or(plan).trim();
+    match plan.to_ascii_lowercase().as_str() {
+        "plus" => "Plus".into(),
+        "team" => "Team".into(),
+        "pro" => "Pro".into(),
+        "free" => "Free".into(),
+        _ => plan.into(),
+    }
+}
+
+/// Shorten source metadata only in the TUI. Keep the source's wall-clock time,
+/// not a guessed timezone conversion; malformed timestamps remain explicit.
+fn usage_note(note: &str, numeric: bool) -> String {
+    note.split(" · ")
+        .filter_map(|part| {
+            let part = part.trim();
+            if numeric
+                && !part.starts_with("Magpie readAt:")
+                && part.to_ascii_lowercase().ends_with(": unknown")
+            {
+                return None;
+            }
+            if let Some(raw) = part.strip_prefix("Magpie readAt: ") {
+                let time = raw.split_once('T').map(|(_, time)| time);
+                let hhmm = time.and_then(|time| time.get(..5)).filter(|time| {
+                    let bytes = time.as_bytes();
+                    bytes[2] == b':'
+                        && bytes
+                            .iter()
+                            .enumerate()
+                            .all(|(i, c)| i == 2 || c.is_ascii_digit())
+                        && time[..2].parse::<u8>().is_ok_and(|h| h < 24)
+                        && time[3..].parse::<u8>().is_ok_and(|m| m < 60)
+                });
+                return Some(match hhmm {
+                    Some(time) => format!("Magpie · updated {time}"),
+                    None => "Magpie · update time unknown".into(),
+                });
+            }
+            (!part.is_empty()).then(|| part.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn usage_window_label(label: &str) -> &str {
+    match label.to_ascii_lowercase().as_str() {
+        "5 hours" | "5 hour" | "5h" => "5h",
+        "7 days" | "7 day" | "7d" | "weekly" => "7d",
+        "daily" | "24 hours" => "24h",
+        _ => label,
+    }
+}
+
+/// A service band, then compact account sections. Percentages always mean USED;
+/// each numeric window has exactly a summary row and a thin pace-aware bar.
 fn usage_card(
     group: &[&herdr_sidebar::usage::Provider],
     width: usize,
@@ -5848,130 +5919,149 @@ fn usage_card(
     folded: bool,
     selected: bool,
 ) -> Vec<Line<'static>> {
+    let Some(first) = group.first() else {
+        return Vec::new();
+    };
+    let width = width.max(1);
     let band = Style::default().bg(palette().selection_bg);
-    let worst = group
-        .iter()
-        .flat_map(|p| p.windows.iter())
-        .max_by(|a, b| a.used.total_cmp(&b.used));
-    let several = group.len() > 1;
-    let plan_badge = |plan: &str| {
-        Span::styled(
-            format!(" {plan} "),
-            Style::default()
-                .bg(palette().muted_button_bg)
-                .fg(palette().muted_button_fg),
-        )
-    };
-    // ▸ folded / ▾ open; the keyboard's card has it in the accent colour.
     let chevron = if folded { "▸" } else { "▾" };
-    let chevron_style = if selected {
-        band.fg(palette().header_accent).bold()
+    let title = truncate_to(format!(" {chevron} {}", first.name), width);
+    let count = if group.len() == 1 {
+        "1 account".into()
     } else {
-        band.dim()
+        format!("{} accounts", group.len())
     };
-    let name_style = if selected {
-        band.bold().underlined()
-    } else {
-        band.bold()
-    };
-    let mut head = vec![
-        Span::styled(format!(" {chevron}"), chevron_style),
-        Span::styled(format!(" {} ", group[0].name), name_style),
-    ];
-    if let Some(plan) = group[0].plan.as_ref().filter(|_| !several) {
-        head.push(plan_badge(plan));
+    let mut head = vec![Span::styled(
+        title,
+        if selected {
+            band.fg(palette().header_accent).bold()
+        } else {
+            band.bold()
+        },
+    )];
+    let remaining = width.saturating_sub(head.iter().map(Span::width).sum::<usize>());
+    if remaining > count.len() {
+        head.push(Span::styled(" ".repeat(remaining - count.len()), band));
+        head.push(Span::styled(count, band.dim()));
     }
-    let worst_text = worst
-        .map(|w| format!("{:.0}% ", w.used))
-        .unwrap_or_default();
-    let used_cells: usize = head.iter().map(Span::width).sum::<usize>() + worst_text.len();
-    head.push(Span::styled(
-        " ".repeat(width.saturating_sub(used_cells)),
-        band,
-    ));
-    head.push(Span::styled(
-        worst_text,
-        band.fg(worst
-            .map(|w| usage_color(w.used, w.limited))
-            .unwrap_or(Color::Reset))
-            .bold(),
-    ));
     let mut lines = vec![Line::from(head)];
     if folded {
         return lines;
     }
+    let content_width = width.saturating_sub(2).max(1);
     for (index, provider) in group.iter().enumerate() {
-        if several {
-            // One section per account: its plan badge and who it is. The
-            // first sits right under the header band; later ones get a
-            // light rule right below the account above, no blank line.
-            if index > 0 {
-                lines.push(Line::styled(
-                    format!(" {}", "─".repeat(width.saturating_sub(2))),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-            let mut sub = vec![Span::raw(" ")];
-            let mut used = 1;
-            if let Some(plan) = &provider.plan {
-                let badge = plan_badge(plan);
-                used += badge.width() + 1;
-                sub.push(badge);
-                sub.push(Span::raw(" "));
-            }
-            if let Some(account) = &provider.account {
-                sub.push(Span::styled(
-                    truncate_to(account.clone(), width.saturating_sub(used + 1)),
-                    Style::default().fg(palette().header_accent),
-                ));
-            }
-            lines.push(Line::from(sub));
-        } else if let Some(account) = &provider.account {
+        if index > 0 {
             lines.push(Line::styled(
-                format!(" {}", truncate_to(account.clone(), width.saturating_sub(2))),
+                format!(" {}", "─".repeat(width.saturating_sub(2))),
                 Style::default().dim(),
             ));
         }
+        let name = usage_account_name(provider.account.as_deref());
+        let plan = provider
+            .plan
+            .as_deref()
+            .map(|p| usage_plan_name(p, provider.name))
+            .unwrap_or_default();
+        let badge_width = if plan.is_empty() {
+            0
+        } else {
+            plan.chars()
+                .count()
+                .min(content_width / 2)
+                .saturating_add(2)
+        };
+        let name_width = content_width
+            .saturating_sub(badge_width + usize::from(badge_width > 0))
+            .max(1);
+        let mut account = vec![
+            Span::raw(" "),
+            Span::styled(
+                truncate_to(name, name_width),
+                Style::default().fg(palette().header_accent).bold(),
+            ),
+        ];
+        if badge_width > 0 && width > 6 {
+            account.push(Span::raw(" "));
+            account.push(Span::styled(
+                format!(" {} ", truncate_to(plan, badge_width.saturating_sub(2))),
+                Style::default()
+                    .bg(palette().muted_button_bg)
+                    .fg(palette().muted_button_fg),
+            ));
+        }
+        lines.extend(herdr_sidebar::wrap::wrap_line(&Line::from(account), width));
         if let Some(err) = &provider.error {
+            lines.extend(herdr_sidebar::wrap::wrap_line(
+                &Line::styled(format!(" ! {err}"), Style::default().fg(palette().deleted)),
+                width,
+            ));
+        }
+        let numeric = provider
+            .windows
+            .iter()
+            .any(|w| w.used.is_finite() && (0.0..=100.0).contains(&w.used));
+        if !numeric {
             lines.push(Line::styled(
-                format!("  ! {err}"),
-                Style::default().fg(palette().deleted),
+                truncate_to("  Usage unknown".into(), width),
+                Style::default().fg(palette().modified),
             ));
         }
         if let Some(note) = &provider.note {
-            lines.push(Line::styled(format!("  {note}"), Style::default().dim()));
+            let note = usage_note(note, numeric);
+            if !note.is_empty() {
+                let style = if note.to_ascii_lowercase().contains("stale") {
+                    Style::default().fg(palette().modified)
+                } else {
+                    Style::default().dim()
+                };
+                lines.extend(herdr_sidebar::wrap::wrap_line(
+                    &Line::styled(format!(" {note}"), style),
+                    width,
+                ));
+            }
         }
-        let bar_cells = width.saturating_sub(4).max(4);
         for w in &provider.windows {
-            lines.push(Line::raw(""));
+            if !w.used.is_finite() || !(0.0..=100.0).contains(&w.used) {
+                lines.extend(herdr_sidebar::wrap::wrap_line(
+                    &Line::styled(
+                        format!(" ! {}: invalid usage", w.label),
+                        Style::default().fg(palette().modified),
+                    ),
+                    width,
+                ));
+                continue;
+            }
             let color = usage_color(w.used, w.limited);
             let pct = format!("{:.0}%", w.used);
-            let badge = if w.limited { " LIMIT " } else { "" };
+            let status = if w.limited {
+                if width < 30 { " !" } else { " LIMIT" }
+            } else {
+                ""
+            };
+            let reset = w
+                .resets_at
+                .map(|reset| format!("reset {}", short_duration(reset - now).replace(' ', "")))
+                .unwrap_or_default();
+            let label_budget =
+                content_width.saturating_sub(pct.len() + status.len() + reset.len() + 2);
+            // On narrow panes reset information wins over a verbose window name.
             let label = truncate_to(
-                w.label.clone(),
-                width.saturating_sub(pct.len() + badge.len() + 5),
+                usage_window_label(&w.label).to_string(),
+                label_budget.max(2),
             );
-            let pad = width.saturating_sub(
-                2 + Span::raw(label.as_str()).width() + badge.len() + pct.len() + 2,
-            );
+            let left = format!("{label} {pct}{status}");
+            let left_width = Span::raw(left.as_str()).width();
             let mut row = vec![
                 Span::raw("  "),
-                Span::styled(label, Style::default().bold()),
-                Span::raw(" ".repeat(pad)),
+                Span::styled(left, Style::default().fg(color).bold()),
             ];
-            if w.limited {
-                row.push(Span::styled(
-                    badge,
-                    Style::default()
-                        .bg(palette().deleted)
-                        .fg(Color::Black)
-                        .bold(),
+            if !reset.is_empty() && left_width + reset.len() < content_width {
+                row.push(Span::raw(
+                    " ".repeat(content_width - left_width - reset.len()),
                 ));
-                row.push(Span::raw(" "));
+                row.push(Span::styled(reset, Style::default().dim()));
             }
-            row.push(Span::styled(pct, Style::default().fg(color).bold()));
-            lines.push(Line::from(row));
-            // Where an even pace would be by now, when the window's length is known.
+            lines.extend(herdr_sidebar::wrap::wrap_line(&Line::from(row), width));
             let pace = match (w.resets_at, w.length_secs) {
                 (Some(reset), Some(len)) if len > 0 => {
                     Some((1.0 - (reset - now) as f64 / len as f64).clamp(0.0, 1.0) * 100.0)
@@ -5979,34 +6069,8 @@ fn usage_card(
                 _ => None,
             };
             let mut bar = vec![Span::raw("  ")];
-            bar.extend(usage_bar(w.used, bar_cells, color, pace));
+            bar.extend(usage_bar(w.used, width.saturating_sub(3), color, pace));
             lines.push(Line::from(bar));
-            let mut detail = vec![Span::raw("  ")];
-            if w.limited {
-                detail.push(Span::styled(
-                    "limit reached · ",
-                    Style::default().fg(palette().deleted).bold(),
-                ));
-            }
-            if let Some(reset) = w.resets_at {
-                detail.push(Span::styled(
-                    format!("resets in {}", short_duration(reset - now)),
-                    Style::default().dim(),
-                ));
-            }
-            // Against the pace marker, in words: only worth saying when ahead.
-            if let Some(p) = pace
-                && !w.limited
-                && w.used > p + 5.0
-            {
-                detail.push(Span::styled(
-                    format!(" · {:.0}% ahead", w.used - p),
-                    Style::default().fg(Color::Indexed(208)),
-                ));
-            }
-            if detail.len() > 1 {
-                lines.push(Line::from(detail));
-            }
         }
     }
     lines
@@ -6140,6 +6204,259 @@ fn rebuild_tree_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn magpie_account_contexts_and_unknown_notes_survive_narrow_cards() {
+        use herdr_sidebar::usage::Provider;
+        let personal = Provider {
+            name: "Codex",
+            plan: Some("plus".into()),
+            account: Some("king 個人 · king0980692@gmail.com".into()),
+            windows: vec![],
+            error: None,
+            note: Some("Magpie · Image generation: Unknown · source data stale".into()),
+        };
+        let team = Provider {
+            name: "Codex",
+            plan: Some("team".into()),
+            account: Some("king 組織 · king0980692@gmail.com · Team".into()),
+            windows: vec![],
+            error: Some("Magpie unavailable; showing stale data".into()),
+            note: None,
+        };
+        for width in [24, 36, 80] {
+            let lines = usage_card(&[&personal, &team], width, 0, false, false);
+            // Remove wrap boundaries only: neither the distinguishing Team
+            // suffix nor aliases may be silently truncated at 36 columns.
+            let text: String = lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert!(text.contains("king 個人"), "{text}");
+            assert!(text.contains("king 組織"), "{text}");
+            assert!(text.contains("Team"), "{text}");
+            assert!(text.contains("Plus"), "{text}");
+            assert!(
+                !text.contains("gmail.com"),
+                "alias replaces raw identity: {text}"
+            );
+            assert!(text.contains("Image generation: Unknown"), "{text}");
+            assert!(text.contains("source data stale"), "{text}");
+            assert!(text.contains("Magpie unavailable"), "{text}");
+            assert!(!text.contains("0%"), "unknown is not zero used: {text}");
+            assert!(lines.iter().all(|line| line.width() <= width));
+        }
+    }
+
+    #[test]
+    fn magpie_codex_fold_counts_accounts_without_implying_all_are_drained() {
+        use herdr_sidebar::usage::{Provider, Window};
+        let personal = Provider {
+            name: "Codex",
+            plan: Some("plus".into()),
+            account: Some("Personal alias".into()),
+            error: None,
+            note: None,
+            windows: vec![Window {
+                label: "Personal weekly".into(),
+                used: 20.0,
+                resets_at: None,
+                length_secs: None,
+                limited: false,
+            }],
+        };
+        let team = Provider {
+            plan: Some("team".into()),
+            account: Some("Organization alias".into()),
+            windows: vec![Window {
+                label: "Team weekly".into(),
+                used: 80.0,
+                resets_at: None,
+                length_secs: None,
+                limited: false,
+            }],
+            ..personal.clone()
+        };
+        let text = |lines: &[Line]| -> String {
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        let open = usage_card(&[&personal, &team], 36, 0, false, false);
+        assert!(text(&open).contains("Personal weekly"));
+        assert!(text(&open).contains("Team weekly"));
+        let folded = usage_card(&[&personal, &team], 36, 0, true, false);
+        assert_eq!(folded.len(), 1);
+        assert!(text(&folded).contains("2 accounts"));
+        assert!(!text(&folded).contains("80%"));
+        assert!(!text(&folded).contains("alias"));
+        let same_alias = Provider {
+            account: personal.account.clone(),
+            ..team.clone()
+        };
+        let distinct = usage_card(&[&personal, &same_alias], 24, 0, false, false);
+        let distinct = text(&distinct);
+        for expected in ["2 accounts", "Plus", "Team", "20%", "80%"] {
+            assert!(distinct.contains(expected), "{expected}: {distinct}");
+        }
+    }
+
+    #[test]
+    fn long_magpie_plan_cannot_push_usage_percentage_offscreen() {
+        use herdr_sidebar::usage::{Provider, Window};
+        let provider = Provider {
+            name: "Codex",
+            plan: Some("ChatGPT Team Enterprise Workspace".into()),
+            account: Some("Team".into()),
+            error: None,
+            note: None,
+            windows: vec![Window {
+                label: "Weekly".into(),
+                used: 80.0,
+                resets_at: None,
+                length_secs: None,
+                limited: false,
+            }],
+        };
+        for width in [24, 36, 80] {
+            let lines = usage_card(&[&provider], width, 0, false, false);
+            assert!(lines.iter().all(|line| line.width() <= width));
+            let header: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(header.contains("1 account"), "{header}");
+            assert!(lines.iter().any(|line| line.to_string().contains("80%")));
+        }
+    }
+
+    #[test]
+    fn compact_magpie_cards_hide_raw_metadata_and_keep_two_line_windows() {
+        use herdr_sidebar::usage::{Provider, Window};
+        let provider = Provider {
+            name: "Codex",
+            plan: Some("Codex Plus".into()),
+            account: Some("leon 個人 · enormous.email.address@example.test".into()),
+            windows: vec![
+                Window {
+                    label: "5 hours".into(),
+                    used: 12.0,
+                    resets_at: Some(16_080),
+                    length_secs: Some(18_000),
+                    limited: false,
+                },
+                Window {
+                    label: "7 days".into(),
+                    used: 44.0,
+                    resets_at: Some(86_400),
+                    length_secs: Some(604_800),
+                    limited: false,
+                },
+            ],
+            note: Some(
+                "Image generation: Unknown · Magpie readAt: 2026-11-16T16:00:03+08:00".into(),
+            ),
+            error: None,
+        };
+        for width in [24, 36, 56] {
+            let lines = usage_card(&[&provider], width, 0, false, false);
+            let text = lines
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("leon 個人"), "{text}");
+            assert!(text.contains("Plus"), "{text}");
+            assert!(text.contains("Magpie · updated 16:00"), "{text}");
+            assert!(text.contains("5h 12%"), "{text}");
+            assert!(text.contains("reset 4h28m"), "{text}");
+            assert!(text.contains("7d 44%"), "{text}");
+            for hidden in ["enormous", "readAt", "2026-", "Unknown", "Codex Plus"] {
+                assert!(!text.contains(hidden), "{hidden}: {text}");
+            }
+            assert_eq!(lines.len(), 7, "{text}");
+            assert!(lines.iter().all(|line| line.width() <= width), "{text}");
+        }
+        // Rendering never changes the backend identity used to distinguish contexts.
+        assert_eq!(
+            provider.account.as_deref(),
+            Some("leon 個人 · enormous.email.address@example.test")
+        );
+    }
+
+    #[test]
+    fn usage_identity_fallback_and_notes_are_honest() {
+        assert_eq!(
+            usage_account_name(Some("same@example.test · Team")),
+            "same@example.test"
+        );
+        assert_eq!(
+            usage_account_name(Some("First · same@example.test")),
+            "First"
+        );
+        assert_eq!(
+            usage_account_name(Some("Second · same@example.test")),
+            "Second"
+        );
+        assert_eq!(
+            usage_account_name(Some("alias · context · same@example.test")),
+            "alias · context"
+        );
+        assert_eq!(usage_account_name(None), "Account");
+        assert_eq!(
+            usage_note("Magpie readAt: invalid", false),
+            "Magpie · update time unknown"
+        );
+        assert!(
+            usage_note("Image generation: Unknown · stale · invalid quota", true)
+                .contains("stale · invalid quota")
+        );
+        assert!(usage_note("Image generation: Unknown", false).contains("Unknown"));
+    }
+
+    #[test]
+    fn invalid_usage_stays_unknown_and_tiny_folded_cards_do_not_panic() {
+        use herdr_sidebar::usage::{Provider, Window};
+        let provider = Provider {
+            name: "Codex",
+            plan: Some("Team".into()),
+            account: Some("work@example.test".into()),
+            windows: vec![Window {
+                label: "5 hours".into(),
+                used: f64::NAN,
+                resets_at: None,
+                length_secs: None,
+                limited: false,
+            }],
+            note: Some("Magpie readAt: Unknown · stale".into()),
+            error: Some("gateway unavailable".into()),
+        };
+        for width in [24, 36] {
+            let lines = usage_card(&[&provider], width, 0, false, false);
+            let text = lines
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+                .join("");
+            for expected in [
+                "Usage unknown",
+                "invalid usage",
+                "stale",
+                "gateway unavailable",
+                "work@",
+            ] {
+                assert!(text.contains(expected), "{expected}: {text}");
+            }
+            assert!(!text.contains("0%"));
+            assert!(!text.contains("readAt"));
+            assert!(lines.iter().all(|line| line.width() <= width));
+        }
+        for width in 0..24 {
+            assert_eq!(usage_card(&[&provider], width, 0, true, true).len(), 1);
+        }
+        assert!(usage_card(&[], 24, 0, false, false).is_empty());
+        assert!(usage_bar(10.0, 0, Color::Reset, Some(20.0)).is_empty());
+    }
 
     #[test]
     fn usage_split_keeps_system_fixed_and_never_overlaps() {

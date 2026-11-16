@@ -647,13 +647,15 @@ fn write_state(path: &Path, state: State) {
     {
         return;
     }
-    // Do not destroy a malformed settings file the user may need to recover.
-    if let Ok(existing) = std::fs::read_to_string(&settings_path)
-        && serde_json::from_str::<serde_json::Value>(&existing)
-            .ok()
-            .and_then(|v| v.as_object().cloned())
-            .is_none()
-    {
+    // Usage backend settings are deliberately file-configured. Keep them (and
+    // other extension fields) when a pane writes its typed UI preferences.
+    // Do not destroy malformed or unreadable settings the user may need to recover.
+    let existing = match std::fs::read_to_string(&settings_path) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return,
+    };
+    if !preserve_extension_settings(&mut value, existing.as_deref()) {
         return;
     }
     let Ok(settings) = serde_json::to_string_pretty(&value) else {
@@ -667,6 +669,54 @@ fn write_state(path: &Path, state: State) {
     if let Ok(local) = serde_json::to_string(&local) {
         let _ = std::fs::write(path, local);
     }
+}
+
+/// Typed UI fields win, while file-only backend/extension preferences survive.
+fn preserve_extension_settings(value: &mut serde_json::Value, existing: Option<&str>) -> bool {
+    let Some(text) = existing else { return true };
+    let Ok(serde_json::Value::Object(old)) = serde_json::from_str(text) else {
+        return false;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    for (key, preference) in old {
+        if !matches!(
+            key.as_str(),
+            "active" | "search_active" | "usage_active" | "font_prompt"
+        ) {
+            object.entry(key).or_insert(preference);
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+#[test]
+fn usage_backend_preferences_survive_ui_settings_updates() {
+    let mut value = serde_json::json!({"sidebar_width": 40, "merged": true});
+    assert!(preserve_extension_settings(
+        &mut value,
+        Some(
+            r#"{"usage_source":"magpie","magpie_url":"http://127.0.0.1:3425","sidebar_width":24,"usage_active":true}"#
+        )
+    ));
+    assert_eq!(value["usage_source"], "magpie");
+    assert_eq!(value["magpie_url"], "http://127.0.0.1:3425");
+    assert_eq!(value["sidebar_width"], 40);
+    assert!(value.get("usage_active").is_none());
+    let mut native = serde_json::json!({"merged": false});
+    assert!(preserve_extension_settings(
+        &mut native,
+        Some(r#"{"usage_source":"native","extension":{"enabled":true}}"#)
+    ));
+    assert_eq!(native["usage_source"], "native");
+    assert_eq!(native["extension"]["enabled"], true);
+    assert!(!preserve_extension_settings(
+        &mut value,
+        Some("invalid json")
+    ));
+    assert!(!preserve_extension_settings(&mut value, Some("[]")));
 }
 
 struct StateWriteLock {

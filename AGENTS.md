@@ -23,12 +23,53 @@ that path. Keep every crate buildable standalone from its own directory.
 
 ## Usage credentials
 
+- Magpie is now the default Usage source (`magpie.rs`): read only the running
+  loopback gateway's `GET /v1/magpie/quotas`. Its HTTP response is `{ "data": [...],
+  "object": ... }`, whereas `magpie quota --json` emits a naked array; do not
+  confuse the two contracts. Never start Magpie or read its credential files.
+- File-only settings `usage_source` (`magpie` or explicitly `native`) and
+  `magpie_url` live in the portable settings.json. `state::write_state` must
+  preserve extension fields when UI preferences change; previously it validated
+  existing JSON but then rebuilt only known fields, silently dropping new keys.
+- Keep each Magpie card (including same-email Personal/Team contexts) separate,
+  aliases and identity visible, and Unknown/text-only windows out of numeric
+  gauges. Wrap account/status lines so a narrow sidebar cannot hide a Team suffix
+  or stale/error warning. Never silently fall back to native credential reads.
+- Magpie snapshots/refresh coordination are shared per user, not per pane; use
+  private runtime storage and crash-released locks. The sidebar does not own
+  account switching, refresh tokens, reset credits, paid credits or model routing.
+- `scripts/test-magpie-gateway.py <built-binary>` runs a hermetic loopback HTTP
+  server: tests the real curl path/envelope, four contexts/aliases, Unknown,
+  cross-process single-fetch cache, sanitized 503 errors and no redirect/native
+  fallback. It uses isolated config/state, not operator credentials.
+- Rust 1.100 clippy flags the pre-existing editor selection range loop; its
+  iterator equivalent preserves text/newline behavior and passes strict lint.
+- Development baseline was fast-forwarded from old `7f63ca4` to `2d1f3b7` on leon,
+  including v0.16.2. Installed mise releases/launcher configs are separate from
+  this checkout. Build into `target/magpie-review` to avoid replacing a live build.
+
+The following login sources apply **only to explicit native mode**:
+
 - Codex usage reads the CLI, pi and PiG logins (`~/.codex/auth.json`,
   `~/.pi/agent/auth.json`, `~/.pig/agent/auth.json`) and deduplicates by ChatGPT
   account ID. PiG can omit `accountId`; `usage.rs` then decodes the access JWT's
   `https://api.openai.com/auth.chatgpt_account_id` claim for the usage request.
   This is not local authentication; the API validates the token. Never log tokens
   or refresh another tool's credentials.
+
+## Mise release rollout and compact quota UI
+
+- Publish a new version rather than overwriting a mise-managed release. Keep
+  Cargo.toml, this crate's Cargo.lock entry and herdr-plugin.toml versions equal.
+  `scripts/install-mise.sh X.Y.Z` selects only this GitHub tool with the literal
+  architecture/OS archive pattern and bin_path=bin; `--dry-run` is hermetically
+  tested. Do not run global `mise install` (all tools) or install in a focus hook.
+- The compact TUI displays alias and plan, account count per service, and two
+  rows per quota window. Raw identities/timestamps remain in Provider/--usage;
+  don't reintroduce long readAt strings or redundant Unknown image notices when
+  subscription windows exist. Stale/errors and wholly unknown quotas stay visible.
+- Cross-machine installation and quota access are separate. Never copy OAuth
+  credentials or expose the full model gateway to solve a quota-only display.
 
 ## Activity-bar shortcuts
 

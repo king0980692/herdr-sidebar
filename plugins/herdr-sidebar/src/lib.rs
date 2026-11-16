@@ -16,6 +16,7 @@ pub mod gitdeco;
 pub mod icons;
 pub mod ipc;
 pub mod launch;
+pub mod magpie;
 pub mod rundir;
 pub mod serve;
 pub mod site;

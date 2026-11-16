@@ -70,6 +70,19 @@ The following login sources apply **only to explicit native mode**:
   subscription windows exist. Stale/errors and wholly unknown quotas stay visible.
 - Cross-machine installation and quota access are separate. Never copy OAuth
   credentials or expose the full model gateway to solve a quota-only display.
+- Modern native remote cores reject legacy `plugin.pane.open` as unavailable to
+  remote plugin panes. Do not retry `--ensure` blindly after a partial refresh:
+  inspect actual process + pane state. Operator-authorized restoration can use
+  the supported native `pane split`/`pane run` surfaces, entering a literal command
+  only in a newly created verified shell, never in an existing worker.
+- Legacy adapters and current cores can expose mirror sidebar records with
+  different pane/terminal handles. Ctrl+Q on a real sidebar may remove its mirror;
+  classify sidebar aliases separately from work bindings. Stale tokens alone
+  are NEVER permission to send Ctrl+Q. Verify actual /proc executable, PID start,
+  foreground group and captured source socket before shutdown. Preserve snapshots
+  and re-open only missing tabs; scoped ensure can partially succeed before error.
+- `pane swap` may move focus with the slot. Restore the pre-operation pane using
+  explicit-ID `pane.focus` API; the CLI focus subcommand is directional only.
 
 ## Activity-bar shortcuts
 

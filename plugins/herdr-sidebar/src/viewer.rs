@@ -1428,18 +1428,16 @@ fn ffmpeg_in_path(path: &std::ffi::OsStr, cwd: Option<&Path>) -> Option<PathBuf>
         .filter(|directory| !cwd.is_some_and(|cwd| directory.starts_with(cwd)))
         .map(|directory| directory.join(executable))
         .find(|candidate| {
-            if !candidate.is_file() {
-                return false;
-            }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
-                candidate
-                    .metadata()
-                    .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+                candidate.is_file()
+                    && candidate
+                        .metadata()
+                        .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
             }
             #[cfg(not(unix))]
-            true
+            candidate.is_file()
         })
 }
 

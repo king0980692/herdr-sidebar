@@ -11,6 +11,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LIMIT: usize = 1024 * 1024;
 const TTL: i64 = 60;
+/// Magpie refreshes quotas on its own cadence (minutes); only flag data that
+/// is clearly older than that, not every card past the 60 s fetch TTL.
+const STALE_AFTER: i64 = 600;
 const DEFAULT_URL: &str = "http://127.0.0.1:3425";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,7 +150,10 @@ fn provider_name(name: &str) -> &'static str {
         "claude" | "anthropic" | "claude-code" => "Claude",
         "codex" | "openai" => "Codex",
         "opencode" | "opencode-go" | "opencode go" => "OpenCode Go",
-        _ => "Magpie",
+        "copilot" | "github-copilot" | "github copilot" => "Copilot",
+        "gemini" | "gemini-cli" | "gemini cli" | "antigravity" => "Gemini",
+        "" | "magpie" => "Magpie",
+        _ => "Other",
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -192,7 +198,14 @@ fn parse_cards(body: &[u8]) -> Result<Vec<Card>, String> {
         if !v.is_object() {
             return Err("Invalid Magpie card".into());
         }
-        let name = provider_name(v["provider"].as_str().or(v["name"].as_str()).unwrap_or(""));
+        // `provider` is Magpie's stable id; `name` is its display label.
+        let name = match provider_name(v["provider"].as_str().unwrap_or("")) {
+            id @ ("Other" | "Magpie") => match provider_name(v["name"].as_str().unwrap_or("")) {
+                "Other" | "Magpie" => id,
+                known => known,
+            },
+            known => known,
+        };
         let user = string(v, "user");
         let alias = string(v, "alias");
         let account = match (alias, user) {
@@ -209,7 +222,16 @@ fn parse_cards(body: &[u8]) -> Result<Vec<Card>, String> {
         }
         if let Some(items) = v["windows"].as_array() {
             for w in items.iter().take(64) {
-                let label = string(w, "name").unwrap_or_else(|| "Quota".into());
+                let mut label = string(w, "name").unwrap_or_else(|| "Quota".into());
+                let display = string(w, "display");
+                // Unmetered windows are a fact, not 0% usage.
+                if display
+                    .as_deref()
+                    .is_some_and(|d| d.eq_ignore_ascii_case("unlimited"))
+                {
+                    notes.push(format!("{label}: unlimited"));
+                    continue;
+                }
                 let pct = |v: &Value| {
                     v.as_f64()
                         .filter(|n| n.is_finite() && (0.0..=100.0).contains(n))
@@ -231,6 +253,13 @@ fn parse_cards(body: &[u8]) -> Result<Vec<Card>, String> {
                     })
                 };
                 if let Some(used) = used {
+                    // Keep Magpie's own count (e.g. "0 / 200") beside the percentage.
+                    if let Some(d) = display
+                        .as_deref()
+                        .filter(|d| d.chars().any(|c| c.is_ascii_digit()) && !d.ends_with('%'))
+                    {
+                        label = format!("{label} {}", d.replace(" / ", "/"));
+                    }
                     windows.push(Quota {
                         label,
                         used,
@@ -266,8 +295,10 @@ fn parse_cards(body: &[u8]) -> Result<Vec<Card>, String> {
     result.sort_by_key(|card| match card.name.as_str() {
         "Claude" => 0,
         "Codex" => 1,
-        "OpenCode Go" => 2,
-        _ => 3,
+        "Copilot" => 2,
+        "OpenCode Go" => 3,
+        "Gemini" => 4,
+        _ => 5,
     });
     Ok(result)
 }
@@ -276,9 +307,10 @@ fn render(snapshot: &Snapshot, time: i64, status: Option<&str>) -> Vec<Provider>
     let mut result = Vec::new();
     for card in &snapshot.cards {
         let source_time = card.read_at.as_deref().and_then(parse_time);
-        let stale = status.is_some()
-            || snapshot.failed
-            || source_time.is_none_or(|t| time.saturating_sub(t) >= TTL);
+        // A busy lock ("updating") is not staleness; only failure or old data is.
+        let stale = snapshot.failed
+            || status == Some("cache unavailable")
+            || source_time.is_none_or(|t| time.saturating_sub(t) >= STALE_AFTER);
         let mut notes = Vec::new();
         if !card.note.is_empty() {
             notes.push(card.note.clone());
@@ -547,7 +579,12 @@ mod tests {
         assert!(!serde_json::to_string(&cards).unwrap().contains("secret"));
         let bad = parse_cards(br#"{"cards":[{"provider":"sk-secret","windows":[{"name":"Bad","used":101},{"name":"Text","used":"50"},{"name":"Negative","used":-1}]}]}"#).unwrap();
         assert!(bad[0].windows.is_empty());
-        assert_eq!(bad[0].name, "Magpie");
+        assert_eq!(bad[0].name, "Other");
+        let copilot = parse_cards(br#"{"data":[{"provider":"copilot","name":"Copilot","windows":[{"name":"Premium requests","used":0,"display":"0 / 200"},{"name":"Chat requests","used":0,"display":"Unlimited"}]}]}"#).unwrap();
+        assert_eq!(copilot[0].name, "Copilot");
+        assert_eq!(copilot[0].windows.len(), 1);
+        assert_eq!(copilot[0].windows[0].label, "Premium requests 0/200");
+        assert!(copilot[0].note.contains("Chat requests: unlimited"));
     }
     #[test]
     fn cache_reuses_backoffs_retains_good_and_separates_endpoints() {
@@ -590,7 +627,15 @@ mod tests {
             failed: false,
             cards: fixture(),
         };
-        let shown = render(&s, parse_time("2026-11-16T00:02:00Z").unwrap(), None);
+        let fresh = render(&s, parse_time("2026-11-16T00:02:00Z").unwrap(), None);
+        assert!(!fresh[0].note.as_ref().unwrap().contains("stale"));
+        let busy = render(
+            &s,
+            parse_time("2026-11-16T00:02:00Z").unwrap(),
+            Some("updating"),
+        );
+        assert!(!busy[0].note.as_ref().unwrap().contains("stale"));
+        let shown = render(&s, parse_time("2026-11-16T00:20:00Z").unwrap(), None);
         assert!(shown[0].note.as_ref().unwrap().contains("stale"));
         assert!(shown[0].note.as_ref().unwrap().contains("+08:00"));
         assert!(parse_cards(b"{\"cards\":[]}").unwrap().is_empty());

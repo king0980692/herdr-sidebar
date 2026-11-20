@@ -71,7 +71,7 @@ class InstallerTests(unittest.TestCase):
         path = self.home / "calls.jsonl"
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
-    def expected_use(self, version="0.16.4"):
+    def expected_use(self, version="0.16.5"):
         return ["--cd", str(self.home), "use", "--global", "--pin",
                 "--minimum-release-age", "0", "--tool-option",
                 "asset_pattern=" + PATTERN, "--tool-option", "bin_path=bin",
@@ -83,7 +83,7 @@ class InstallerTests(unittest.TestCase):
         calls = self.calls()
         self.assertEqual(calls[0]["args"], self.expected_use())
         self.assertEqual(calls[1]["args"], ["--cd", str(self.home), "where",
-                                          "github:king0980692/herdr-sidebar@0.16.4"])
+                                          "github:king0980692/herdr-sidebar@0.16.5"])
         self.assertEqual(result.stdout.strip(), str(self.home / "resolved installation/bin/herdr-sidebar"))
         tools = json.loads(self.config.read_text())
         self.assertEqual(tools["node"], "22.0.0")
@@ -97,19 +97,19 @@ class InstallerTests(unittest.TestCase):
 
     def test_dry_run_same_argv_without_mutation(self):
         before = self.config.read_bytes()
-        result = self.run_script("--dry-run", "0.16.4")
+        result = self.run_script("--dry-run", "0.16.5")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([call["args"] for call in self.calls()],
                          [self.expected_use() + ["--dry-run"]])
         self.assertEqual(self.config.read_bytes(), before)
 
     def test_reject_version_injection_before_mise(self):
-        for version in ["", "latest", "v0.16.4", "0.16", "0.16.4.4", "0..3",
-                        "0.16.4;touch injected", "$(touch injected)", "--yes",
-                        "0.16.4\n1.2.3", "0.16.4@latest", "0.16.4-beta"]:
+        for version in ["", "latest", "v0.16.5", "0.16", "0.16.5.4", "0..3",
+                        "0.16.5;touch injected", "$(touch injected)", "--yes",
+                        "0.16.5\n1.2.3", "0.16.5@latest", "0.16.5-beta"]:
             with self.subTest(version=version):
                 self.assertEqual(self.run_script(version).returncode, 2)
-        self.assertEqual(self.run_script("0.16.4", "1.2.3").returncode, 2)
+        self.assertEqual(self.run_script("0.16.5", "1.2.3").returncode, 2)
         self.assertEqual(self.calls(), [])
         self.assertFalse((self.project / "injected").exists())
 

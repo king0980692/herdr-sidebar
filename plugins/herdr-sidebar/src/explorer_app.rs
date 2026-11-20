@@ -5869,9 +5869,17 @@ fn usage_plan_name(plan: &str, service: &str) -> String {
 /// Shorten source metadata only in the TUI. Keep the source's wall-clock time,
 /// not a guessed timezone conversion; malformed timestamps remain explicit.
 fn usage_note(note: &str, numeric: bool) -> String {
+    // Fresh Magpie data needs no timestamp on every card; show it only when it
+    // explains a warning (stale data or a cache problem).
+    let flagged = note
+        .split(" · ")
+        .any(|p| matches!(p.trim(), "stale" | "cache unavailable"));
     note.split(" · ")
         .filter_map(|part| {
             let part = part.trim();
+            if part == "updating" || (!flagged && part.starts_with("Magpie readAt:")) {
+                return None;
+            }
             if numeric
                 && !part.starts_with("Magpie readAt:")
                 && part.to_ascii_lowercase().ends_with(": unknown")
@@ -5901,13 +5909,22 @@ fn usage_note(note: &str, numeric: bool) -> String {
         .join(" · ")
 }
 
-fn usage_window_label(label: &str) -> &str {
-    match label.to_ascii_lowercase().as_str() {
-        "5 hours" | "5 hour" | "5h" => "5h",
-        "7 days" | "7 day" | "7d" | "weekly" => "7d",
-        "daily" | "24 hours" => "24h",
-        _ => label,
+fn usage_window_label(label: &str) -> String {
+    let short = |l: &str| -> Option<&'static str> {
+        Some(match l.to_ascii_lowercase().as_str() {
+            "5 hours" | "5 hour" | "5h" => "5h",
+            "7 days" | "7 day" | "7d" | "weekly" => "7d",
+            "daily" | "24 hours" => "24h",
+            _ => return None,
+        })
+    };
+    // "7 days · Fable" → "7d Fable": the scope survives, the period shrinks.
+    if let Some((period, scope)) = label.split_once(" · ")
+        && let Some(p) = short(period.trim())
+    {
+        return format!("{p} {}", scope.trim());
     }
+    short(label).map_or_else(|| label.to_string(), str::to_string)
 }
 
 /// A service band, then compact account sections. Percentages always mean USED;
@@ -6045,10 +6062,7 @@ fn usage_card(
             let label_budget =
                 content_width.saturating_sub(pct.len() + status.len() + reset.len() + 2);
             // On narrow panes reset information wins over a verbose window name.
-            let label = truncate_to(
-                usage_window_label(&w.label).to_string(),
-                label_budget.max(2),
-            );
+            let label = truncate_to(usage_window_label(&w.label), label_budget.max(2));
             let left = format!("{label} {pct}{status}");
             let left_width = Span::raw(left.as_str()).width();
             let mut row = vec![
@@ -6367,16 +6381,34 @@ mod tests {
                 .join("\n");
             assert!(text.contains("leon 個人"), "{text}");
             assert!(text.contains("Plus"), "{text}");
-            assert!(text.contains("Magpie · updated 16:00"), "{text}");
+            // Fresh data carries no per-card timestamp.
+            assert!(!text.contains("updated"), "{text}");
             assert!(text.contains("5h 12%"), "{text}");
             assert!(text.contains("reset 4h28m"), "{text}");
             assert!(text.contains("7d 44%"), "{text}");
             for hidden in ["enormous", "readAt", "2026-", "Unknown", "Codex Plus"] {
                 assert!(!text.contains(hidden), "{hidden}: {text}");
             }
-            assert_eq!(lines.len(), 7, "{text}");
+            assert_eq!(lines.len(), 6, "{text}");
             assert!(lines.iter().all(|line| line.width() <= width), "{text}");
         }
+        let mut stale = provider.clone();
+        stale.note = Some("Magpie readAt: 2026-11-16T16:00:03+08:00 · stale".into());
+        let text = usage_card(&[&stale], 36, 0, false, false)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Magpie · updated 16:00 · stale"), "{text}");
+        assert_eq!(usage_window_label("7 days · Fable"), "7d Fable");
+        assert_eq!(
+            usage_window_label("Premium requests 0/200"),
+            "Premium requests 0/200"
+        );
+        assert_eq!(
+            usage_note("Magpie readAt: 2026-11-16T16:00:03+08:00 · updating", true),
+            ""
+        );
         // Rendering never changes the backend identity used to distinguish contexts.
         assert_eq!(
             provider.account.as_deref(),
@@ -6404,8 +6436,8 @@ mod tests {
         );
         assert_eq!(usage_account_name(None), "Account");
         assert_eq!(
-            usage_note("Magpie readAt: invalid", false),
-            "Magpie · update time unknown"
+            usage_note("Magpie readAt: invalid · stale", false),
+            "Magpie · update time unknown · stale"
         );
         assert!(
             usage_note("Image generation: Unknown · stale · invalid quota", true)

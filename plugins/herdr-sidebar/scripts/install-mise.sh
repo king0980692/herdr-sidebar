@@ -5,10 +5,10 @@ set -eu
 
 usage() {
   printf '%s\n' 'Usage: install-mise.sh [--dry-run] [X.Y.Z]' \
-    'Default release: 0.16.4. Requires an existing mise installation.'
+    'Default release: 0.16.5. Requires an existing mise installation.'
 }
 
-version=0.16.4
+version=0.16.5
 version_given=0
 dry_run=0
 for arg do

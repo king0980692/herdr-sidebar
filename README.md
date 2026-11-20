@@ -55,7 +55,7 @@ use dotted bars rather than appearing as zero usage.
 With mise already installed, from this checkout run:
 
 ```sh
-sh plugins/herdr-sidebar/scripts/install-mise.sh 0.16.4
+sh plugins/herdr-sidebar/scripts/install-mise.sh 0.16.5
 ```
 
 The installer pins only `github:king0980692/herdr-sidebar` globally and selects

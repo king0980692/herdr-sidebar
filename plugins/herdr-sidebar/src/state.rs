@@ -210,6 +210,11 @@ impl ColorTheme {
         }
     }
 
+    /// The theme a settings page names.
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::from_state_name(label)
+    }
+
     /// This palette is drawn for a LIGHT terminal background: the preview's
     /// syntax theme, diff tints and icon colors follow it.
     pub fn is_light(self) -> bool {
@@ -419,7 +424,7 @@ pub fn state_path() -> Option<PathBuf> {
     Some(state_dir()?.join("state.json"))
 }
 
-fn editor_command_path() -> Option<PathBuf> {
+pub fn editor_command_path() -> Option<PathBuf> {
     Some(state_dir()?.join("editor-command.txt"))
 }
 
@@ -427,6 +432,20 @@ pub fn load_editor_command() -> Option<String> {
     let command = std::fs::read_to_string(editor_command_path()?).ok()?;
     let command = command.trim().to_string();
     (!command.is_empty()).then_some(command)
+}
+
+/// Forgets the custom editor command (the environment's editor applies).
+pub fn clear_editor_command() -> bool {
+    let Some(path) = editor_command_path() else {
+        return false;
+    };
+    let Some(_lock) = StateWriteLock::acquire(&path) else {
+        return false;
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => true,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 pub fn save_editor_command(command: &str) -> bool {
@@ -508,7 +527,7 @@ fn legacy_state_path() -> Option<PathBuf> {
 }
 
 /// User preferences are portable; view selection and prompt state stay local.
-fn settings_path() -> Option<PathBuf> {
+pub fn settings_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)

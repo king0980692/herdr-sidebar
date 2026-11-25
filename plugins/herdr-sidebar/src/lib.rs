@@ -26,6 +26,7 @@ pub mod launch;
 pub mod magpie;
 pub mod rundir;
 pub mod serve;
+pub mod settings;
 pub mod site;
 pub mod snooze;
 pub mod state;

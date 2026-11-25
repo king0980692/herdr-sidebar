@@ -58,9 +58,19 @@ pub struct DockFollow {
     viewed: Option<Viewed>,
     /// The root last shown in each workspace.
     roots: HashMap<String, PathBuf>,
+    /// When the settings last changed, as last seen.
+    settings_seen: Option<std::time::SystemTime>,
 }
 
 impl DockFollow {
+    /// Whether the settings changed since last asked (never on the first
+    /// ask). Call at the poll's pace.
+    pub fn settings_changed(&mut self) -> bool {
+        let now = crate::settings::changed_at();
+        let before = std::mem::replace(&mut self.settings_seen, now);
+        before.is_some() && before != now
+    }
+
     /// The viewed location, asked for at most every [`POLL_EVERY`].
     pub fn poll(&mut self, current_root: &Path, follow_cwd: bool) -> Option<Step> {
         if self.last_poll.is_some_and(|at| at.elapsed() < POLL_EVERY) {

@@ -1291,13 +1291,21 @@ impl App {
             return true;
         }
         let follow_cwd = self.sidebar_state.follow_cwd;
-        let step = {
+        let (step, settings_changed) = {
             let mut follower = self.cwd_follower.borrow_mut();
             let dock = follower
                 .dock
                 .get_or_insert_with(herdr_sidebar::dock::DockFollow::default);
-            dock.poll(&self.cwd, follow_cwd)
+            match dock.poll(&self.cwd, follow_cwd) {
+                Some(step) => (Some(step), dock.settings_changed()),
+                None => (None, false),
+            }
         };
+        // Changed in herdr's settings page: start afresh with them.
+        if settings_changed {
+            let cwd_follower = std::rc::Rc::clone(&self.cwd_follower);
+            *self = App::new(self.cwd.clone(), cwd_follower);
+        }
         let Some(step) = step else { return true };
         if let (Some(pane), Some(ctl)) = (step.anchor_pane, self.pane_ctl.as_mut()) {
             ctl.pane_id = pane;
@@ -2560,6 +2568,13 @@ impl App {
     // ---- Settings modal ----
 
     fn open_settings(&mut self) {
+        if herdr_sidebar::host::is_dock() {
+            self.flash = Some((
+                "Settings: herdr's settings page, Files section".into(),
+                false,
+            ));
+            return;
+        }
         herdr_sidebar::updates::check();
         self.overlay = Some(Overlay::Settings {
             selected: 0,
@@ -4368,7 +4383,12 @@ impl App {
                 );
             }
         }
-        let gear_text = format!(" {} ", gear_icon(self.theme));
+        // In dock mode the settings are herdr-native's (its settings page).
+        let gear_text = if herdr_sidebar::host::is_dock() {
+            String::new()
+        } else {
+            format!(" {} ", gear_icon(self.theme))
+        };
         let gear_w = Span::raw(gear_text.as_str()).width() as u16;
         let gear_x = area.x + area.width.saturating_sub(gear_w);
         self.zones.gear = Rect::new(gear_x, outer_top, gear_w, 3);
@@ -4422,7 +4442,7 @@ impl App {
         };
         // In unified mode the ⚙ lives in the activity bar; standalone puts it
         // at the header's right edge.
-        let gear = if self.merged() {
+        let gear = if self.merged() || herdr_sidebar::host::is_dock() {
             None
         } else {
             Some(Span::styled(

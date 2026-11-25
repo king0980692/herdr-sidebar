@@ -1000,13 +1000,21 @@ impl App {
         }
         let root = self.tree.root_path();
         let follow_cwd = self.sidebar_state.follow_cwd;
-        let step = {
+        let (step, settings_changed) = {
             let mut follower = self.cwd_follower.borrow_mut();
             let dock = follower
                 .dock
                 .get_or_insert_with(herdr_sidebar::dock::DockFollow::default);
-            dock.poll(&root, follow_cwd)
+            match dock.poll(&root, follow_cwd) {
+                Some(step) => (Some(step), dock.settings_changed()),
+                None => (None, false),
+            }
         };
+        // Changed in herdr's settings page: start afresh with them.
+        if settings_changed {
+            let follower = std::rc::Rc::clone(&self.cwd_follower);
+            *self = App::new(root.clone(), follower);
+        }
         let Some(step) = step else { return true };
         if let (Some(pane), Some(ctl)) = (step.anchor_pane, self.pane_ctl.as_mut()) {
             ctl.pane_id = pane;
@@ -2411,6 +2419,10 @@ impl App {
     // ---- Settings modal ----
 
     fn open_settings(&mut self) {
+        if herdr_sidebar::host::is_dock() {
+            self.notice = Some("Settings: herdr's settings page, Files section".into());
+            return;
+        }
         herdr_sidebar::updates::check();
         self.suspend_search_for_modal();
         self.overlay = Some(Overlay::Settings {
@@ -4363,7 +4375,8 @@ impl App {
     /// lives in the activity bar instead), and the hover title-action buttons
     /// sit just left of it.
     fn draw_header(&mut self, frame: &mut Frame, area: Rect) {
-        let gear = (!self.merged()).then(|| {
+        // In dock mode the settings are herdr-native's (its settings page).
+        let gear = (!self.merged() && !herdr_sidebar::host::is_dock()).then(|| {
             Span::styled(
                 format!("{} ", gear_icon(self.theme)),
                 Style::default().dim(),
@@ -4592,7 +4605,12 @@ impl App {
                 );
             }
         }
-        let gear_text = format!(" {} ", gear_icon(self.theme));
+        // In dock mode the settings are herdr-native's (its settings page).
+        let gear_text = if herdr_sidebar::host::is_dock() {
+            String::new()
+        } else {
+            format!(" {} ", gear_icon(self.theme))
+        };
         let gear_w = Span::raw(gear_text.as_str()).width() as u16;
         let gear_x = area.x + area.width.saturating_sub(gear_w);
         self.gear = Rect::new(gear_x, outer_top, gear_w, 3);

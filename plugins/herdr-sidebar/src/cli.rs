@@ -105,6 +105,22 @@ pub fn main_with_args(args: Vec<String>) -> std::io::Result<()> {
             return crate::serve::run(std::path::Path::new(path), bind_ip);
         }
         Some("--run-custom-editor") => return crate::actions::run_configured_editor(),
+        // For a host's settings page: the settings as JSON, and one change.
+        Some("--settings-list") => {
+            println!(
+                "{}",
+                serde_json::to_string(&crate::settings::list()).map_err(std::io::Error::other)?
+            );
+            return Ok(());
+        }
+        Some("--settings-set") => {
+            let (Some(key), Some(value)) = (arg(1), arg(2)) else {
+                return Err(std::io::Error::other("usage: --settings-set <key> <json>"));
+            };
+            let value: serde_json::Value =
+                serde_json::from_str(&value).map_err(std::io::Error::other)?;
+            return crate::settings::set(&key, &value).map_err(std::io::Error::other);
+        }
         Some("--launch-decision") => {
             // Optional second arg picks the source-control decision; default
             // is the explorer/sidebar decision.

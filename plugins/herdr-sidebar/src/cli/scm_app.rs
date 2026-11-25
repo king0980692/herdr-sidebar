@@ -4959,6 +4959,10 @@ impl App {
                 ("4", "search"),
             ]);
         }
+        // Docked: herdr shows, hides and sets it up.
+        if herdr_sidebar::host::is_dock() {
+            hints.retain(|(key, _)| !matches!(*key, "s" | "b" | "q"));
+        }
         hints
     }
 

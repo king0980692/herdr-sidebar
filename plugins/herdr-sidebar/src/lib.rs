@@ -12,6 +12,7 @@ pub mod ansi;
 pub mod branch_ui;
 pub mod cli;
 pub mod diffview;
+pub mod dock;
 pub mod editor;
 pub mod ensure;
 pub mod find;

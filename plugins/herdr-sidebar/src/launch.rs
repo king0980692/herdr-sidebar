@@ -78,6 +78,8 @@ pub struct CwdFollower {
     selected: Option<String>,
     initialized: bool,
     manual_override: bool,
+    /// Dock mode: the viewed location is followed instead of a tab's panes.
+    pub dock: Option<crate::dock::DockFollow>,
 }
 
 impl CwdFollower {

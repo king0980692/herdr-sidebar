@@ -827,20 +827,38 @@ struct ClickZones {
 
 /// Handle for identity/label control of our own pane over the socket API.
 struct PaneCtl {
+    /// Our own pane; in dock mode, the viewed pane we act beside (we have
+    /// no pane of our own to rename or resize).
     pane_id: String,
+    dock: bool,
 }
 
 impl PaneCtl {
     fn from_env() -> Option<Self> {
+        if herdr_sidebar::host::is_dock() {
+            let pane_id = herdr_sidebar::dock::fetch_viewed()
+                .and_then(|viewed| viewed.pane_id)
+                .unwrap_or_default();
+            return Some(Self {
+                pane_id,
+                dock: true,
+            });
+        }
         let pane_id = std::env::var("HERDR_PANE_ID")
             .ok()
             .filter(|id| !id.is_empty())?;
-        Some(Self { pane_id })
+        Some(Self {
+            pane_id,
+            dock: false,
+        })
     }
 
     /// Set or clear the pane label — cleared while collapsed so the sliver
     /// has no border title.
     fn set_label(&self, label: Option<&str>) {
+        if self.dock {
+            return;
+        }
         let mut params = serde_json::json!({ "pane_id": self.pane_id });
         if let Some(label) = label {
             params["label"] = serde_json::Value::String(label.to_string());
@@ -851,6 +869,9 @@ impl PaneCtl {
     /// Resize our pane to `target` terminal columns over the socket API
     /// (`pane.resize` takes a split-RATIO delta; the plan converts columns).
     fn resize_to(&self, current: u16, target: u16, dock_right: bool) {
+        if self.dock {
+            return;
+        }
         let Ok(layout) = herdr_sidebar::ipc::call_text(
             "pane.layout",
             serde_json::json!({ "pane_id": self.pane_id }),
@@ -873,6 +894,9 @@ impl PaneCtl {
     }
 
     fn resize_preferred(&self, current: u16, target: u16, dock_right: bool) {
+        if self.dock {
+            return;
+        }
         let Ok(layout) = herdr_sidebar::ipc::call_text(
             "pane.layout",
             serde_json::json!({ "pane_id": self.pane_id }),
@@ -899,6 +923,9 @@ impl PaneCtl {
     }
 
     fn layout_width(&self) -> Option<i64> {
+        if self.dock {
+            return None;
+        }
         let layout = herdr_sidebar::ipc::call_text(
             "pane.layout",
             serde_json::json!({ "pane_id": self.pane_id }),
@@ -911,6 +938,9 @@ impl PaneCtl {
     /// view's (one Sidebar pane satisfies both plugins' launchers), otherwise
     /// clear the other view's token.
     fn report_tokens(&self, my: View, merged: bool) {
+        if self.dock {
+            return;
+        }
         herdr_sidebar::ipc::report_identity(&self.pane_id, my, merged);
     }
 }
@@ -1172,6 +1202,10 @@ impl App {
     }
 
     fn close(&mut self, snooze: bool) {
+        // The files dock stays: herdr shows or hides it.
+        if herdr_sidebar::host::is_dock() {
+            return;
+        }
         // Closing our own pane kills this process: save a pending remembered
         // root first (the outer loop's flush never runs on this path).
         super::flush_pending_root();
@@ -1228,6 +1262,9 @@ impl App {
 
     /// Re-stamp the identity tokens so launchers know this pane is alive.
     pub fn heartbeat(&mut self) {
+        if self.dock_step() {
+            return;
+        }
         self.poll_unified_close();
         if self.last_beat.elapsed() < std::time::Duration::from_secs(5) {
             return;
@@ -1237,6 +1274,44 @@ impl App {
             ctl.report_tokens(MY_VIEW, self.merged());
         }
         self.follow_sibling_cwd();
+    }
+
+    /// Dock mode: show the viewed workspace's repositories and follow its
+    /// pane's folder, acting beside the viewed pane. Whether in dock mode.
+    fn dock_step(&mut self) -> bool {
+        if !herdr_sidebar::host::is_dock() {
+            return false;
+        }
+        if self.overlay.is_some()
+            || self.picking.is_some()
+            || self.suggesting.is_some()
+            || self.syncing.is_some()
+            || commit_draft_present(self.repos.iter().map(|repo| repo.message.as_slice()))
+        {
+            return true;
+        }
+        let follow_cwd = self.sidebar_state.follow_cwd;
+        let step = {
+            let mut follower = self.cwd_follower.borrow_mut();
+            let dock = follower
+                .dock
+                .get_or_insert_with(herdr_sidebar::dock::DockFollow::default);
+            dock.poll(&self.cwd, follow_cwd)
+        };
+        let Some(step) = step else { return true };
+        if let (Some(pane), Some(ctl)) = (step.anchor_pane, self.pane_ctl.as_mut()) {
+            ctl.pane_id = pane;
+        }
+        let Some(target) = step.root.filter(|root| root.is_dir()) else {
+            return true;
+        };
+        if std::env::set_current_dir(&target).is_err() {
+            return true;
+        }
+        let root = std::env::current_dir().unwrap_or(target);
+        let cwd_follower = std::rc::Rc::clone(&self.cwd_follower);
+        *self = App::new(root, cwd_follower);
+        true
     }
 
     fn poll_unified_close(&mut self) -> bool {
@@ -1744,7 +1819,8 @@ impl App {
 
     fn on_list_key(&mut self, key: KeyEvent) -> Option<Exit> {
         match key.code {
-            KeyCode::Char('q') => return Some(Exit::Quit),
+            // The files dock stays: herdr shows or hides it.
+            KeyCode::Char('q') if !herdr_sidebar::host::is_dock() => return Some(Exit::Quit),
             // Esc never quits the sidebar — it closes the preview instead.
             KeyCode::Esc => self.close_preview(),
             KeyCode::Tab => self.focus = Focus::Message,

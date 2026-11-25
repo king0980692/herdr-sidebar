@@ -1174,7 +1174,7 @@ impl App {
     fn close(&mut self, snooze: bool) {
         // Closing our own pane kills this process: save a pending remembered
         // root first (the outer loop's flush never runs on this path).
-        crate::flush_pending_root();
+        super::flush_pending_root();
         // A direct pane close kills the process without a Drop/signal hook.
         // Persist drafts first; failure keeps the live pane open with the
         // existing error notice from persist_scm().
@@ -1209,7 +1209,7 @@ impl App {
     }
 
     /// Re-read every repo's git status (this is the change auto-detection —
-    /// tick() calls it every [`crate::REFRESH_EVERY`]); keeps the flash so
+    /// tick() calls it every [`super::REFRESH_EVERY`]); keeps the flash so
     /// periodic ticks don't eat notices.
     pub fn refresh(&mut self) {
         let mut error = None;

@@ -3612,7 +3612,7 @@ fn register_viewer_pane(
 }
 
 fn start_viewer_pane(pane_id: &str) -> bool {
-    let command = format!("{} --preview", crate::state::EXECUTABLE_NAME);
+    let command = crate::host::shell_line(&["--preview"]);
     ipc::call_text(
         "pane.send_input",
         serde_json::json!({ "pane_id": pane_id, "text": command, "keys": ["Enter"] }),

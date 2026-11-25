@@ -726,7 +726,7 @@ pub fn open_in_editor_tab(my_pane_id: &str, root: &Path, file: &Path) -> io::Res
         "pane.send_input",
         serde_json::json!({
             "pane_id": pane_id,
-            "text": format!("{} --run-custom-editor", crate::state::EXECUTABLE_NAME),
+            "text": crate::host::shell_line(&["--run-custom-editor"]),
             "keys": ["Enter"],
         }),
     ) {

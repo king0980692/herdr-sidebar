@@ -31,10 +31,8 @@ pub fn start(path: &Path, bind_ip: &str) -> io::Result<String> {
 /// Run this binary again as `<flag> <path> <bind-ip>` in its own process
 /// group and return the URL it prints once it is listening.
 pub(crate) fn spawn_server(flag: &str, path: &Path, bind_ip: &str) -> io::Result<String> {
-    let exe = std::env::current_exe()?;
-    let mut cmd = Command::new(exe);
-    cmd.arg(flag)
-        .arg(path)
+    let mut cmd = crate::host::command(&[flag])?;
+    cmd.arg(path)
         .arg(bind_ip)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

@@ -211,18 +211,38 @@ pub fn set(key: &str, value: &Value) -> Result<(), String> {
 }
 
 /// When the settings were last changed (by anyone), to reload on change.
+/// Not the state file: it keeps only which view is shown, which the sidebar
+/// writes itself on every view switch (a reload there undid the switch).
 pub fn changed_at() -> Option<std::time::SystemTime> {
+    watched()
+        .into_iter()
+        .filter_map(|path| {
+            std::fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .ok()
+        })
+        .max()
+}
+
+/// The files a settings change writes.
+fn watched() -> Vec<std::path::PathBuf> {
     [
         crate::state::settings_path(),
-        crate::state::state_path(),
         crate::state::editor_command_path(),
     ]
     .into_iter()
     .flatten()
-    .filter_map(|path| {
-        std::fs::metadata(path)
-            .and_then(|meta| meta.modified())
-            .ok()
-    })
-    .max()
+    .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_view_switch_is_not_a_settings_change() {
+        // The state file records the shown view (written on every switch);
+        // watching it reloaded the dock and undid Usage -> file tree.
+        let state = crate::state::state_path().expect("a state path");
+        assert!(!super::watched().contains(&state));
+        assert!(!super::watched().is_empty());
+    }
 }
